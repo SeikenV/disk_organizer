@@ -60,6 +60,9 @@ fn main() -> std::io::Result<()> {
             (drive, disk_organizer::mft_scan::parse_records(image.bytes))
         }
     };
+    // Normalize to the bare drive letter ("C:" / "C:\" -> "C") so snapshots and
+    // full_path() are consistent regardless of how the user typed the drive.
+    let drive = drive.trim_end_matches([':', '\\', '/']).to_ascii_uppercase();
     eprintln!("{} records.", records.len());
 
     if let Some(path) = &args.save_snapshot {

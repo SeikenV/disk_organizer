@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 /// Turn a volume-relative item path (e.g. `\Users\me\x`) into a real path on
 /// `drive` (e.g. `C:\Users\me\x`).
 pub fn full_path(drive: &str, item_path: &Path) -> PathBuf {
+    // Accept "C", "C:", "C:\" etc. — normalize to the bare letter.
+    let drive = drive.trim_end_matches([':', '\\', '/']);
     let rel = item_path.to_string_lossy();
     let rel = rel.trim_start_matches(['\\', '/']);
     PathBuf::from(format!("{drive}:\\{rel}"))
@@ -59,6 +61,9 @@ mod tests {
     fn full_path_prepends_drive() {
         assert_eq!(full_path("C", Path::new(r"\Users\me\x")), PathBuf::from(r"C:\Users\me\x"));
         assert_eq!(full_path("D", Path::new(r"pagefile.sys")), PathBuf::from(r"D:\pagefile.sys"));
+        // Drive may arrive with a colon/backslash; must not produce C::\...
+        assert_eq!(full_path("C:", Path::new(r"\Users\me\x")), PathBuf::from(r"C:\Users\me\x"));
+        assert_eq!(full_path("C:\\", Path::new(r"\Users\me\x")), PathBuf::from(r"C:\Users\me\x"));
     }
 
     #[test]
@@ -78,7 +83,7 @@ mod tests {
         std::fs::write(&f, b"bye").unwrap();
         assert!(f.exists());
 
-        let results = delete_to_recycle_bin(&[f.clone()]);
+        let results = delete_to_recycle_bin(std::slice::from_ref(&f));
         assert_eq!(results.len(), 1);
         assert!(results[0].1.is_ok(), "trash failed: {:?}", results[0].1);
         assert!(!f.exists(), "file should be gone from its original location");
