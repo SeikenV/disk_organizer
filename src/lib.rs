@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod cut;
+pub mod delete;
 pub mod format;
 pub mod index;
 pub mod model;
