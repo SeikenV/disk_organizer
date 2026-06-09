@@ -1,26 +1,52 @@
 use crate::index::Index;
 use crate::model::ROOT_FRN;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Full path for `frn`, walking parent links to ROOT_FRN, memoized in `cache`.
-/// Healthy MFT parent chains are acyclic; self-references and orphans terminate.
+///
+/// Iterative and cycle-guarded: a deep parent chain cannot overflow the stack,
+/// and a parent cycle (A->B->A, which a real/corrupt MFT can contain) terminates
+/// with a `<cycle:N>` marker instead of recursing forever.
 pub fn path_for(frn: u64, index: &Index, cache: &mut HashMap<u64, PathBuf>) -> PathBuf {
     if let Some(p) = cache.get(&frn) {
         return p.clone();
     }
-    let path = match index.by_frn.get(&frn) {
-        None => PathBuf::from(format!("<orphan:{frn}>")),
-        Some(_) if frn == ROOT_FRN => PathBuf::from("\\"),
-        Some(rec) if rec.parent_frn == frn => PathBuf::from(&rec.name), // self-ref guard
-        Some(rec) => {
-            let mut parent = path_for(rec.parent_frn, index, cache);
-            parent.push(&rec.name);
-            parent
+    // Walk upward collecting the chain until we hit a cached path, the root, an
+    // orphan, a self-reference, or a cycle.
+    let mut chain: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut cur = frn;
+    let base: PathBuf = loop {
+        if let Some(p) = cache.get(&cur) {
+            break p.clone();
+        }
+        if cur == ROOT_FRN {
+            break PathBuf::from("\\");
+        }
+        match index.by_frn.get(&cur) {
+            None => break PathBuf::from(format!("<orphan:{cur}>")),
+            Some(rec) => {
+                if !seen.insert(cur) {
+                    break PathBuf::from(format!("<cycle:{cur}>"));
+                }
+                chain.push(cur);
+                if rec.parent_frn == cur {
+                    break PathBuf::from("\\"); // self-parent: treat as a top-level node
+                }
+                cur = rec.parent_frn;
+            }
         }
     };
-    cache.insert(frn, path.clone());
-    path
+    // Build downward from the base, memoizing every directory on the way.
+    let mut path = base;
+    for &node in chain.iter().rev() {
+        if let Some(rec) = index.by_frn.get(&node) {
+            path.push(&rec.name);
+        }
+        cache.insert(node, path.clone());
+    }
+    cache.get(&frn).cloned().unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -51,5 +77,17 @@ mod tests {
         let mut cache = HashMap::new();
         let p = path_for(20, &idx, &mut cache);
         assert!(p.to_string_lossy().contains("orphan:999"));
+    }
+
+    #[test]
+    fn cycle_terminates() {
+        // A(10).parent=B(11) and B(11).parent=A(10): a 2-cycle must not recurse forever.
+        let idx = crate::index::build_index(vec![
+            rec(10, 11, "A", true),
+            rec(11, 10, "B", true),
+        ]);
+        let mut cache = HashMap::new();
+        let p = path_for(10, &idx, &mut cache);
+        assert!(p.to_string_lossy().contains("cycle"));
     }
 }

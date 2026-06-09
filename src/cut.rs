@@ -2,14 +2,15 @@ use crate::catalog::match_path;
 use crate::index::Index;
 use crate::model::{DirAgg, Item, Risk, Source, ROOT_FRN};
 use crate::paths::path_for;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Produce non-overlapping, classified items, ranked largest-first.
 pub fn cut(index: &Index, totals: &HashMap<u64, DirAgg>, threshold: u64) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::new();
     let mut cache: HashMap<u64, PathBuf> = HashMap::new();
-    walk(ROOT_FRN, true, index, totals, threshold, &mut out, &mut cache);
+    let mut visited: HashSet<u64> = HashSet::new();
+    walk(ROOT_FRN, true, index, totals, threshold, &mut out, &mut cache, &mut visited);
     out.sort_by_key(|it| (std::cmp::Reverse(it.physical_size), it.frn));
     out
 }
@@ -19,6 +20,7 @@ fn agg(totals: &HashMap<u64, DirAgg>, frn: u64) -> (u64, u64) {
 }
 
 /// Returns bytes claimed (emitted) under and including `frn`.
+#[allow(clippy::too_many_arguments)] // private recursive helper; threading state is clearer than a struct
 fn walk(
     frn: u64,
     is_root: bool,
@@ -27,7 +29,13 @@ fn walk(
     threshold: u64,
     out: &mut Vec<Item>,
     cache: &mut HashMap<u64, PathBuf>,
+    visited: &mut HashSet<u64>,
 ) -> u64 {
+    // Guard against cycles / re-entry: never process the same record twice.
+    if !visited.insert(frn) {
+        return 0;
+    }
+
     // Known directory → emit whole subtree as one item, do not descend.
     if !is_root {
         let path = path_for(frn, index, cache);
@@ -52,7 +60,7 @@ fn walk(
         for &child in children {
             match index.by_frn.get(&child) {
                 Some(rec) if rec.is_dir => {
-                    claimed += walk(child, false, index, totals, threshold, out, cache);
+                    claimed += walk(child, false, index, totals, threshold, out, cache, visited);
                 }
                 Some(rec) if rec.physical_size >= threshold => {
                     let cpath = path_for(child, index, cache);

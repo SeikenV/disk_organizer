@@ -91,7 +91,8 @@ fn main() -> std::io::Result<()> {
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    let chosen = match parse_selection(line.trim(), items.len()) {
+    let input = line.trim().trim_start_matches('\u{feff}').trim();
+    let chosen = match parse_selection(input, items.len()) {
         Ok(v) if v.is_empty() => { eprintln!("Nothing selected. Bye."); return Ok(()); }
         Ok(v) => v,
         Err(e) => { eprintln!("Invalid selection: {e}"); return Ok(()); }
