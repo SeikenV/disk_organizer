@@ -64,11 +64,24 @@ fn walk(
                 }
                 Some(rec) if rec.physical_size >= threshold => {
                     let cpath = path_for(child, index, cache);
-                    let (category, purpose, risk) = classify_file(&cpath);
+                    // Catalog first (covers root-level system files like $MFT,
+                    // pagefile.sys); fall back to the extension heuristic.
+                    let (category, purpose, risk, source) = match match_path(&cpath) {
+                        Some(entry) => (
+                            entry.category.to_string(),
+                            entry.purpose.to_string(),
+                            entry.risk,
+                            Source::Rule,
+                        ),
+                        None => {
+                            let (category, purpose, risk) = classify_file(&cpath);
+                            (category, purpose, risk, Source::Heuristic)
+                        }
+                    };
                     out.push(Item {
                         frn: child, path: cpath, is_dir: false,
                         physical_size: rec.physical_size, file_count: 1,
-                        category, purpose, risk, source: Source::Heuristic,
+                        category, purpose, risk, source,
                     });
                     claimed += rec.physical_size;
                 }
@@ -151,6 +164,19 @@ mod tests {
         assert_eq!(npm.physical_size, 1000);
         // The blob inside npm-cache must NOT also appear as its own item.
         assert!(!items.iter().any(|i| i.path.ends_with("blob")));
+    }
+
+    #[test]
+    fn root_level_system_file_uses_catalog() {
+        // A big file directly under root (e.g. pagefile.sys / $MFT) must be
+        // classified by the catalog, not the generic extension heuristic.
+        let index = crate::index::build_index(vec![file(30, ROOT_FRN, "$MFT", 5000)]);
+        let totals = crate::aggregate::aggregate(&index);
+        let items = cut(&index, &totals, 100);
+        let mft = items.iter().find(|i| i.path.ends_with("$MFT")).expect("$MFT item");
+        assert_eq!(mft.source, Source::Rule);
+        assert_eq!(mft.risk, Risk::System);
+        assert_eq!(mft.category, "Master File Table");
     }
 
     #[test]

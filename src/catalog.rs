@@ -47,6 +47,8 @@ pub fn catalog() -> &'static [CatalogEntry] {
         // --- system (System: never delete) ---
         CatalogEntry { pattern: "windows/winsxs", category: "Windows component store", purpose: "Servicing store (hardlinked); manage via DISM only", risk: System },
         CatalogEntry { pattern: "windows/system32", category: "Windows system files", purpose: "Core OS files; do not delete", risk: System },
+        CatalogEntry { pattern: "system volume information", category: "System Restore / VSS", purpose: "Restore points & shadow copies; manage via System Protection, do not delete", risk: System },
+        CatalogEntry { pattern: "windows/installer", category: "Windows Installer cache", purpose: "MSI/MSP cache; needed for repair/uninstall — prune with care", risk: Caution },
         CatalogEntry { pattern: "pagefile.sys", category: "Virtual memory", purpose: "Paging file; resize via System settings, do not delete", risk: System },
         CatalogEntry { pattern: "hiberfil.sys", category: "Hibernation file", purpose: "Hibernation image; disable via powercfg, do not delete", risk: System },
         CatalogEntry { pattern: "swapfile.sys", category: "Swap file", purpose: "System swap file; managed by Windows", risk: System },
@@ -113,5 +115,13 @@ mod tests {
     #[test]
     fn no_match_for_ordinary_dir() {
         assert!(match_path(Path::new(r"\Users\dongm\projects\myapp")).is_none());
+    }
+
+    #[test]
+    fn matches_mft_and_new_entries() {
+        assert_eq!(match_path(Path::new(r"\$MFT")).unwrap().category, "Master File Table");
+        assert_eq!(match_path(Path::new(r"\$MFT")).unwrap().risk, Risk::System);
+        assert_eq!(match_path(Path::new(r"\System Volume Information")).unwrap().risk, Risk::System);
+        assert_eq!(match_path(Path::new(r"\Windows\Installer")).unwrap().risk, Risk::Caution);
     }
 }
