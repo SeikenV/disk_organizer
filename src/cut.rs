@@ -54,18 +54,17 @@ fn walk(
                 Some(rec) if rec.is_dir => {
                     claimed += walk(child, false, index, totals, threshold, out, cache);
                 }
-                Some(rec) => {
-                    if rec.physical_size >= threshold {
-                        let cpath = path_for(child, index, cache);
-                        let (category, purpose, risk) = classify_file(&cpath);
-                        out.push(Item {
-                            frn: child, path: cpath, is_dir: false,
-                            physical_size: rec.physical_size, file_count: 1,
-                            category, purpose, risk, source: Source::Heuristic,
-                        });
-                        claimed += rec.physical_size;
-                    }
+                Some(rec) if rec.physical_size >= threshold => {
+                    let cpath = path_for(child, index, cache);
+                    let (category, purpose, risk) = classify_file(&cpath);
+                    out.push(Item {
+                        frn: child, path: cpath, is_dir: false,
+                        physical_size: rec.physical_size, file_count: 1,
+                        category, purpose, risk, source: Source::Heuristic,
+                    });
+                    claimed += rec.physical_size;
                 }
+                Some(_) => {} // file below threshold; folds into residual
                 None => {}
             }
         }
