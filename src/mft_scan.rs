@@ -40,8 +40,9 @@ pub fn parse_records(mft_bytes: Vec<u8>) -> Vec<RawRecord> {
 
         let frn = entry.header.record_number;
 
-        // Best (non-DOS) name + its parent. find_best_name_attribute already
-        // excludes the DOS 8.3 alias.
+        // Best name + its parent. find_best_name_attribute prefers a Win32 /
+        // Win32AndDos name and only falls back to a DOS-only/POSIX name when no
+        // Win32 name exists (rare). Good enough for the M1a first cut.
         let name_attr = match entry.find_best_name_attribute() {
             Some(n) => n,
             None => continue,

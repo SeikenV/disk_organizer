@@ -22,7 +22,7 @@ struct Args {
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    let min = args.min_size_mb * 1024 * 1024;
+    let min = args.min_size_mb.saturating_mul(1024 * 1024);
 
     eprintln!(
         "Reading MFT for {}: (requires Administrator) ...",

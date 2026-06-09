@@ -167,9 +167,13 @@ pub fn read_mft(drive: &str) -> io::Result<MftImage> {
             .map_err(to_io)?;
 
             if bytes_read == 0 {
-                // Unexpected short read; stop to avoid an infinite loop.
-                bytes.truncate(start);
-                break;
+                // A zero-byte read mid-extent would desync record numbers from
+                // buffer offsets (record N must live at N*record_size). Fail
+                // loudly rather than silently corrupt all downstream FRNs.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected zero-byte read while reading $MFT extent",
+                ));
             }
 
             // Trim if the OS returned fewer bytes than requested.
@@ -255,9 +259,14 @@ fn read_mft_extents(mft: &OwnedHandle) -> io::Result<Vec<(u64, u64)>> {
         let start_lcn = ext.Lcn;
         prev_vcn = ext.NextVcn;
 
-        // Lcn == -1 marks a sparse/unallocated run; skip it (shouldn't occur for $MFT).
+        // Lcn == -1 marks a sparse/unallocated run. $MFT is never sparse, and
+        // silently skipping a run would desync record numbers from buffer
+        // offsets, so treat it as an error rather than dropping bytes.
         if start_lcn < 0 {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected sparse run in $MFT",
+            ));
         }
         extents.push((start_lcn as u64, cluster_count));
     }
