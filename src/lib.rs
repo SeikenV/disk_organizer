@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod format;
 pub mod index;
 pub mod model;
