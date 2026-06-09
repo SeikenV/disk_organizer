@@ -1,5 +1,7 @@
 # M1a Scanner Core Implementation Plan
 
+> ⚠️ **SUPERSEDED (2026-06-08).** The project chose the **MFT-direct** scanner — see [2026-06-08-m1a-mft-scanner-core.md](2026-06-08-m1a-mft-scanner-core.md) and the [MFT synthesis](../research/2026-06-08-mft-approach-synthesis.md). This jwalk-based design is retained as the **non-NTFS / no-admin fallback** (deferred), where its `winapi-util` size-gated hardlink dedup still applies.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a correct, parallel disk-size scanner CLI that prints the Top-N largest directories and files on a Windows NTFS path, with hardlink dedup and reparse-point skipping (so WinSxS does not over-count).
