@@ -4,5 +4,7 @@
 # Cloned upstream projects kept locally for reference only (not vendored into git)
 /references
 
-# Local scan snapshots
+# Local scan snapshots / output (contain personal disk listings)
 *.snapshot.json
+scan_output.txt
+*.scan.txt
