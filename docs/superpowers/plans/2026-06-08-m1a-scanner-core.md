@@ -6,7 +6,9 @@
 
 **Architecture:** A `jwalk` parallel walk produces a flat stream of file entries. We skip reparse-point directories (no descent) and deduplicate hardlinked files (by `same-file::Handle`, gated to files ≥ a size threshold). Files are aggregated into per-directory subtree totals via ancestor accumulation. The CLI prints Top-N directories (by subtree total) and Top-N files (by size).
 
-**Tech Stack:** Rust (edition 2021), `jwalk` (parallel walk), `same-file` (file identity / hardlink dedup), `clap` (CLI), `tempfile` (dev-only test fixtures). Windows-only target.
+**Tech Stack:** Rust (edition 2021), `jwalk` (parallel walk), `winapi-util` (cheap attributes-only handle to read a file ID for hardlink dedup — recipe adapted from bootandy/dust), `clap` (CLI), `tempfile` (dev-only test fixtures). Windows-only target.
+
+> Why not a library? See [reference analysis](../research/2026-06-08-reference-projects-hardlink-analysis.md): `dua` is nightly-only on Windows, `pdu` disables hardlink dedup off-Unix, `dust` punts on plain-file dedup. The only reusable piece is dust's `winapi-util` file-ID recipe, folded into Task 3.
 
 ---
 
@@ -62,8 +64,10 @@ edition = "2021"
 
 [dependencies]
 jwalk = "0.8"
-same-file = "1.0"
 clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -160,13 +164,25 @@ git commit -m "feat: reparse-point attribute detection"
 Create `src/identity.rs`:
 
 ```rust
-use same_file::Handle;
+// Windows file-identity for hardlink dedup.
+//
+// `std::os::windows::fs::MetadataExt::file_index()` is nightly-only (feature
+// `windows_by_handle`). To stay on stable Rust we open a cheap attributes-only
+// handle and read the file ID via `winapi-util`.
+//
+// The limited-access-mode trick (FILE_READ_ATTRIBUTES, deliberately avoiding
+// FILE_READ_DATA) is adapted from bootandy/dust (Apache-2.0): it skips the cost
+// and the Windows Defender scan that a full read handle would incur.
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// Tracks file identities so a hardlinked file is counted only once.
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+
+/// Tracks (volume serial, file index) pairs so a hardlinked file counts once.
 pub struct Deduper {
-    seen: HashSet<Handle>,
+    seen: HashSet<(u64, u64)>,
 }
 
 impl Deduper {
@@ -175,12 +191,12 @@ impl Deduper {
     }
 
     /// Returns true the first time a given physical file is seen, false for
-    /// subsequent hardlinks to the same file. If the handle cannot be opened
-    /// (permissions, locked), defaults to counting it (true) to avoid undercount.
+    /// subsequent hardlinks to the same file. On any error (permission, locked)
+    /// defaults to counting it (true) to avoid undercounting.
     pub fn should_count(&mut self, path: &Path) -> bool {
-        match Handle::from_path(path) {
-            Ok(handle) => self.seen.insert(handle),
-            Err(_) => true,
+        match file_id(path) {
+            Some(id) => self.seen.insert(id),
+            None => true,
         }
     }
 }
@@ -189,6 +205,17 @@ impl Default for Deduper {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Read (volume serial number, file index) via a cheap attributes-only handle.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .open(path)
+        .ok()?;
+    let handle = winapi_util::Handle::from_file(file);
+    let info = winapi_util::file::information(&handle).ok()?;
+    Some((info.volume_serial_number(), info.file_index()))
 }
 
 #[cfg(test)]
@@ -770,7 +797,7 @@ git commit -m "feat: CLI for top directories and files"
 
 **Spec coverage (against architecture doc §3 components for M1a + functional F1/F2):**
 - F1 parallel scan → Task 7 (`jwalk`, parallel by default). ✓
-- F2 hardlink dedup → Tasks 3 + 7 (size-gated `same-file::Handle`). ✓
+- F2 hardlink dedup → Tasks 3 + 7 (size-gated `winapi-util` file-ID, dust recipe). ✓
 - F2 reparse skip → Tasks 2 + 7 (`process_read_dir` prune + per-file skip). ✓
 - F2 permission/locked tolerance → Task 7 (`Err(_) => continue`). ✓
 - C2 tree aggregation → Tasks 4–5. ✓

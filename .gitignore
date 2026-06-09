@@ -1,0 +1,8 @@
+# Rust build output
+/target
+
+# Cloned upstream projects kept locally for reference only (not vendored into git)
+/references
+
+# Local scan snapshots
+*.snapshot.json
