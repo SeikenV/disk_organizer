@@ -13,6 +13,10 @@ pub fn aggregate(index: &Index) -> HashMap<u64, DirAgg> {
         if rec.is_dir {
             continue;
         }
+        // Currently a no-op: by_frn is keyed by FRN, so each file appears once
+        // and insert() is always true. It becomes load-bearing once a hardlinked
+        // file is placed under each of its parents (multi-parent refinement) —
+        // then physical_size must still be counted only once across the tree.
         let phys = if physical_seen.insert(frn) { rec.physical_size } else { 0 };
 
         let mut cur = rec.parent_frn;

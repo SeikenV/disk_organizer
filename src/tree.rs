@@ -9,7 +9,9 @@ pub fn top_n_dirs(totals: &HashMap<u64, DirAgg>, min_physical: u64, n: usize) ->
         .filter(|(_, a)| a.physical_size >= min_physical)
         .map(|(frn, a)| (*frn, a.clone()))
         .collect();
-    v.sort_by(|a, b| b.1.physical_size.cmp(&a.1.physical_size));
+    // Largest first; tie-break by FRN so output is deterministic across runs
+    // (HashMap iteration order is otherwise random).
+    v.sort_by_key(|(frn, a)| (std::cmp::Reverse(a.physical_size), *frn));
     v.truncate(n);
     v
 }
@@ -22,7 +24,7 @@ pub fn top_n_files(index: &Index, min_physical: u64, n: usize) -> Vec<(u64, RawR
         .filter(|(_, r)| !r.is_dir && r.physical_size >= min_physical)
         .map(|(frn, r)| (*frn, r.clone()))
         .collect();
-    v.sort_by(|a, b| b.1.physical_size.cmp(&a.1.physical_size));
+    v.sort_by_key(|(frn, r)| (std::cmp::Reverse(r.physical_size), *frn));
     v.truncate(n);
     v
 }
