@@ -17,6 +17,7 @@ use std::time::Duration;
 
 pub use content::analyze_directory_contents;
 pub use llm::health_check as is_ollama_running;
+pub use llm::preload_model;
 pub use llm::summarize_report;
 pub use llm::{DirSummary, FinalReport};
 
@@ -564,35 +565,27 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     let start_time = Instant::now();
 
     // ---- Backend-specific state ----
-    // Each backend gets its own HTTP client, endpoint, and congestion controller.
-    let (http_client_gpu, gpu_endpoint) = {
-        let c = Arc::new(
-            reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(gpu_threads.max(1))
-                .build()
-                .expect("failed to create dGPU HTTP client"),
-        );
-        let ep = Arc::new(config.endpoint.clone());
-        (c, ep)
-    };
+    // ollama-rs manages its own HTTP connection pool internally.
+    // We just pass endpoint strings — each llm:: function creates an Ollama
+    // instance on the fly (cheap, just wraps a URL).
 
-    let (http_client_igpu, igpu_endpoint_arc, igpu_cwnd_ctl): (
-        Option<Arc<reqwest::blocking::Client>>,
-        Option<Arc<String>>,
-        Option<Arc<CwndCtl>>,
-    ) = if has_igpu {
-        let c = Arc::new(
-            reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(igpu_threads)
-                .build()
-                .expect("failed to create iGPU HTTP client"),
-        );
+    let gpu_endpoint = Arc::new(config.endpoint.clone());
+
+    let (igpu_endpoint_arc, igpu_cwnd_ctl): (Option<Arc<String>>, Option<Arc<CwndCtl>>) = if has_igpu {
         let ep = Arc::new(config.igpu_endpoint.clone().unwrap());
         let cc = Arc::new(CwndCtl::new());
-        (Some(c), Some(ep), Some(cc))
+        (Some(ep), Some(cc))
     } else {
-        (None, None, None)
+        (None, None)
     };
+
+    // ---- Preload model into GPU memory (avoids cold-start on first request) ----
+    info!("[LLM] Preloading model '{}' into memory ...", config.model);
+    if let Err(e) = llm::preload_model(&config.endpoint, &config.model) {
+        warn!("[LLM] Model preload failed (non-fatal): {e}");
+    } else {
+        info!("[LLM] Model preloaded successfully.");
+    }
 
     let gpu_cwnd_ctl = Arc::new(CwndCtl::new());
     let next_idx = Arc::new(AtomicUsize::new(0));
@@ -632,7 +625,6 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
 
         // Shared helper to spawn one worker with a given backend.
         let spawn_workers = |handles: &mut Vec<_>, count: usize, cwnd_ctl: Arc<CwndCtl>,
-                             client: Arc<reqwest::blocking::Client>,
                              endpoint: Arc<String>| {
             for _ in 0..count {
                 let cwnd_ctl = Arc::clone(&cwnd_ctl);
@@ -640,7 +632,6 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                 let model = Arc::clone(&model);
                 let next_idx = Arc::clone(&next_idx);
                 let done_cnt = Arc::clone(&done_cnt);
-                let client = Arc::clone(&client);
                 let work = &work;
                 let total = total;
                 let attempts_cnt = Arc::clone(&total_attempts_cnt);
@@ -671,7 +662,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                             }
                             attempts_cnt.fetch_add(1, Ordering::Relaxed);
                             let call_start = Instant::now();
-                            match do_summarize(&client, &endpoint, &model, wi) {
+                            match do_summarize(&endpoint, &model, wi) {
                                 Ok(summary) => {
                                     let latency_ms = call_start.elapsed().as_secs_f64() * 1000.0;
                                     let latency_us = (latency_ms * 1000.0) as u64;
@@ -722,11 +713,11 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
         };
 
         // Spawn dGPU group.
-        spawn_workers(&mut handles, gpu_threads, Arc::clone(&gpu_cwnd_ctl), Arc::clone(&http_client_gpu), Arc::clone(&gpu_endpoint));
+        spawn_workers(&mut handles, gpu_threads, Arc::clone(&gpu_cwnd_ctl), Arc::clone(&gpu_endpoint));
 
         // Spawn iGPU group (if configured).
-        if let (Some(c), Some(ep), Some(cc)) = (http_client_igpu, igpu_endpoint_arc, igpu_cwnd_ctl) {
-            spawn_workers(&mut handles, igpu_threads, Arc::clone(&cc), Arc::clone(&c), Arc::clone(&ep));
+        if let (Some(ep), Some(cc)) = (igpu_endpoint_arc, igpu_cwnd_ctl) {
+            spawn_workers(&mut handles, igpu_threads, Arc::clone(&cc), Arc::clone(&ep));
         }
 
         // Merge.
@@ -953,14 +944,12 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
         }
     } else {
         for attempt in 1..=2 {
-            let report_client = reqwest::blocking::Client::new();
             if attempt > 1 {
                 warn!("[LLM] Retrying final report (attempt {attempt})...");
             } else {
                 info!("\n[LLM] Requesting final summary and cleanup plan...");
             }
             report_result = llm::summarize_report(
-                &report_client,
                 &config.endpoint,
                 &config.model,
                 &safe_items,
@@ -1223,18 +1212,18 @@ fn sample_children(frn: u64, index: &Index, max: usize) -> Vec<String> {
 
 // ---- Dispatch LLM call ----
 
-fn do_summarize(client: &reqwest::blocking::Client, endpoint: &str, model: &str, wi: &WorkItem) -> Result<DirSummary, String> {
+fn do_summarize(endpoint: &str, model: &str, wi: &WorkItem) -> Result<DirSummary, String> {
     let path_str = wi.path.to_string_lossy();
     match &wi.kind {
         WorkKind::Dir { samples, ancestor_context } => {
-            llm::summarize_dir(client, endpoint, model, &path_str, samples, ancestor_context.as_deref())
+            llm::summarize_dir(endpoint, model, &path_str, samples, ancestor_context.as_deref())
         }
         WorkKind::File {
             ext,
             parent_dir,
             siblings,
             ancestor_context,
-        } => llm::summarize_file(client, endpoint, model, &path_str, parent_dir, siblings, ext, ancestor_context.as_deref()),
+        } => llm::summarize_file(endpoint, model, &path_str, parent_dir, siblings, ext, ancestor_context.as_deref()),
     }
 }
 
