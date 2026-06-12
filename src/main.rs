@@ -1,17 +1,18 @@
 use clap::Parser;
 use disk_organizer::aggregate::aggregate;
 use disk_organizer::cut::cut;
-use disk_organizer::delete::{delete_to_recycle_bin, full_path, plan};
-use disk_organizer::format::human;
+use disk_organizer::enrich::{self, is_ollama_running, LlmConfig};
 use disk_organizer::index::build_index;
-use disk_organizer::model::{Item, RawRecord, Risk};
-use disk_organizer::select::parse_selection;
+use disk_organizer::model::RawRecord;
+use disk_organizer::report::{self, ReportFile};
 use disk_organizer::snapshot;
-use std::io::Write;
+use flexi_logger::{FileSpec, Logger, WriteMode};
+use log::{info, warn, error};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "disk_organizer", about = "Classify and clean up disk usage via the NTFS MFT")]
+#[command(name = "disk_organizer", about = "Classify disk usage via NTFS MFT. Outputs JSON.")]
 struct Args {
     /// Drive letter to scan, e.g. C (omit when using --from-snapshot)
     drive: Option<String>,
@@ -25,126 +26,159 @@ struct Args {
     /// Analyze a saved snapshot instead of reading the MFT (no admin needed)
     #[arg(long)]
     from_snapshot: Option<PathBuf>,
-    /// Print what would be deleted without deleting
+    /// Use a local LLM (Ollama) to classify unknown directories
     #[arg(long)]
-    dry_run: bool,
-}
-
-fn risk_tag(r: Risk) -> &'static str {
-    match r {
-        Risk::Safe => "[SAFE]   ",
-        Risk::Caution => "[CAUTION]",
-        Risk::System => "[SYSTEM] ",
-        Risk::Unknown => "[UNKNOWN]",
-    }
+    llm: bool,
+    /// Override LLM endpoint (default: http://localhost:11434)
+    #[arg(long, default_value = "http://localhost:11434")]
+    llm_endpoint: String,
+    /// Optional iGPU/CPU inference endpoint (e.g. llama-server on port 8080)
+    #[arg(long)]
+    llm_igpu_endpoint: Option<String>,
+    /// Fraction of threads for iGPU backend (0.0-1.0, default: 0.3)
+    #[arg(long, default_value_t = 0.3)]
+    llm_igpu_weight: f64,
+    /// Override LLM model (default: qwen3.5:0.8b)
+    #[arg(long, default_value = "qwen3.5:0.8b")]
+    llm_model: String,
+    /// Number of filenames to sample per unknown directory (default: 20)
+    #[arg(long, default_value_t = 20)]
+    llm_samples: usize,
+    /// Enable debug mode: verbose logs written to disk (disk_organizer.log)
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    init_logger(args.debug)?;
     let min = args.min_size_mb.saturating_mul(1024 * 1024);
+    let program_start = Instant::now();
+
+    // ---- Phase timing ----
+    let mut timings: Vec<(&str, Duration)> = Vec::new();
 
     // 1. Obtain records: from snapshot, or by reading the MFT.
+    let t0 = Instant::now();
     let (drive, records): (String, Vec<RawRecord>) = match &args.from_snapshot {
         Some(path) => {
-            eprintln!("Loading snapshot {} ...", path.display());
+            info!("Loading snapshot {} ...", path.display());
             let snap = snapshot::load(path)?;
             (snap.drive, snap.records)
         }
         None => {
             let drive = args.drive.clone().unwrap_or_else(|| {
-                eprintln!("error: provide a drive letter or --from-snapshot");
+                error!("provide a drive letter or --from-snapshot");
                 std::process::exit(2);
             });
-            eprintln!("Reading MFT for {drive}: (requires Administrator) ...");
+            info!("Reading MFT for {drive}: (requires Administrator) ...");
             let image = disk_organizer::volume::read_mft(&drive)?;
             (drive, disk_organizer::mft_scan::parse_records(image.bytes))
         }
     };
-    // Normalize to the bare drive letter ("C:" / "C:\" -> "C") so snapshots and
-    // full_path() are consistent regardless of how the user typed the drive.
     let drive = drive.trim_end_matches([':', '\\', '/']).to_ascii_uppercase();
-    eprintln!("{} records.", records.len());
+    info!("{} records.", records.len());
+    timings.push(("load_records", t0.elapsed()));
 
     if let Some(path) = &args.save_snapshot {
         snapshot::save(path, &drive, &records)?;
-        eprintln!("Saved snapshot to {}", path.display());
+        info!("Saved snapshot to {}", path.display());
     }
 
     // 2. Classify.
+    let t0 = Instant::now();
     let index = build_index(records);
     let totals = aggregate(&index);
     let mut items = cut(&index, &totals, min);
     items.truncate(args.top);
+    timings.push(("classify", t0.elapsed()));
 
-    // 3. Print the numbered, risk-annotated list.
-    println!("\n#   Risk       Size        Category — path");
-    for (i, it) in items.iter().enumerate() {
-        println!(
-            "{:>3} {} {:>10}  {} — {}",
-            i + 1, risk_tag(it.risk), human(it.physical_size), it.category, it.path.display()
-        );
+    // 2.1 Make all paths absolute (prepend drive letter).
+    let drive_prefix = format!("{drive}:");
+    for it in &mut items {
+        let rel = it.path.clone();
+        it.path = PathBuf::from(format!("{drive_prefix}{}", rel.display()));
     }
-    println!("\nLegend: SAFE=cache/regenerable, CAUTION=review first, SYSTEM=never deleted, UNKNOWN=unclassified");
 
-    // 4. Prompt for selection.
-    print!("\nEnter numbers to delete (e.g. 1 3 5), or just Enter to quit: ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let input = line.trim().trim_start_matches('\u{feff}').trim();
-    let chosen = match parse_selection(input, items.len()) {
-        Ok(v) if v.is_empty() => { eprintln!("Nothing selected. Bye."); return Ok(()); }
-        Ok(v) => v,
-        Err(e) => { eprintln!("Invalid selection: {e}"); return Ok(()); }
-    };
+    // 2.3 Content analysis: for known directories, inspect actual contents.
+    let t0 = Instant::now();
+    enrich::analyze_directory_contents(&mut items, &index);
+    timings.push(("content_analysis", t0.elapsed()));
 
-    let selected: Vec<Item> = chosen.iter().map(|&i| items[i].clone()).collect();
-    let p = plan(&selected);
-
-    // 5. Summarize + confirm.
-    if !p.skipped_system.is_empty() {
-        eprintln!("\nSkipping {} SYSTEM item(s) (never auto-deleted):", p.skipped_system.len());
-        for it in &p.skipped_system {
-            eprintln!("  - {}", it.path.display());
+    // 2.5 LLM enrichment (if requested and available).
+    let mut enrich_report: Option<ReportFile> = None;
+    if args.llm {
+        let config = LlmConfig {
+            endpoint: args.llm_endpoint.clone(),
+            igpu_endpoint: args.llm_igpu_endpoint.clone(),
+            igpu_weight: args.llm_igpu_weight,
+            model: args.llm_model.clone(),
+            sample_count: args.llm_samples,
+        };
+        if is_ollama_running(&config.endpoint) {
+            match ReportFile::create() {
+                Ok(rf) => { enrich_report = Some(rf); }
+                Err(e) => warn!("cannot create report file: {e}"),
+            }
+            let t0 = Instant::now();
+            enrich::enrich_items(&config, &mut items, &index, &mut enrich_report);
+            timings.push(("llm_enrich", t0.elapsed()));
+        } else {
+            info!("{}", enrich::setup_hint());
         }
     }
-    if p.deletable.is_empty() {
-        eprintln!("Nothing deletable selected. Bye.");
-        return Ok(());
+
+    // 3. Output JSON to stdout.
+    let t0 = Instant::now();
+    let json = serde_json::to_string_pretty(&items)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    println!("{json}");
+    timings.push(("output_json", t0.elapsed()));
+
+    // ---- Timing report ----
+    let total = program_start.elapsed();
+    info!("");
+    info!("{}", "=".repeat(70));
+    info!("  BENCHMARK TIMING REPORT");
+    info!("{}", "=".repeat(70));
+    for (name, dur) in &timings {
+        let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+        let bar = "█".repeat((pct / 2.0) as usize);
+        info!("  {:>20}: {:>7.1}s ({:>5.1}%) {}",
+            name, dur.as_secs_f64(), pct, bar);
     }
-    println!(
-        "\nAbout to send {} item(s) to the Recycle Bin: {} (SAFE {}, CAUTION {}).",
-        p.deletable.len(), human(p.total_bytes), p.safe, p.caution
-    );
+    info!("  {:>20}: {:>7.1}s", "TOTAL", total.as_secs_f64());
+    info!("{}", "=".repeat(70));
 
-    let full: Vec<PathBuf> = p.deletable.iter().map(|it| full_path(&drive, &it.path)).collect();
-
-    if args.dry_run {
-        println!("[dry-run] would delete:");
-        for path in &full {
-            println!("  {}", path.display());
+    // Write timing to report file if we have one.
+    if let Some(ref mut rep) = enrich_report {
+        let _ = rep.section("BENCHMARK TIMING REPORT");
+        for (name, dur) in &timings {
+            let _ = rep.kv(name, &report::fmt_dur(*dur));
         }
-        return Ok(());
+        let _ = rep.kv("TOTAL", &report::fmt_dur(total));
+        let _ = rep.flush();
+        info!("Full report written to {}", rep.path().display());
     }
 
-    print!("Type 'yes' to confirm: ");
-    std::io::stdout().flush()?;
-    let mut confirm = String::new();
-    std::io::stdin().read_line(&mut confirm)?;
-    if confirm.trim() != "yes" {
-        eprintln!("Cancelled.");
-        return Ok(());
-    }
+    Ok(())
+}
 
-    // 6. Delete to Recycle Bin.
-    let results = delete_to_recycle_bin(&full);
-    let mut ok = 0;
-    for (path, res) in &results {
-        match res {
-            Ok(()) => ok += 1,
-            Err(e) => eprintln!("  FAILED {}: {e}", path.display()),
-        }
+fn init_logger(debug: bool) -> std::io::Result<()> {
+    if debug {
+        Logger::try_with_str("debug")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .log_to_stderr()
+            .log_to_file(FileSpec::default().basename("disk_organizer"))
+            .write_mode(WriteMode::BufferAndFlush)
+            .start()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    } else {
+        Logger::try_with_env_or_str("info")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .log_to_stderr()
+            .start()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     }
-    println!("Moved {ok}/{} item(s) to the Recycle Bin.", results.len());
     Ok(())
 }

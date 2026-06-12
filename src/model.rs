@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// MFT record number of the volume root directory.
-pub const ROOT_FRN: u64 = 5;
+/// Re-exported from `crate::consts` — the canonical definition lives there.
+pub use crate::consts::ROOT_FRN;
 
 /// One physical file/directory parsed from a single MFT record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -27,7 +28,7 @@ pub struct DirAgg {
 }
 
 /// Cleanup risk. Decided by rules, never by guesses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Risk {
     Safe,    // cache/temp/regenerable — deleting loses nothing important
     Caution, // possibly wanted (downloads, media, user data)
@@ -36,7 +37,7 @@ pub enum Risk {
 }
 
 /// Where an item's classification came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     Rule,      // matched the catalog
     Heuristic, // file-extension guess
@@ -45,10 +46,10 @@ pub enum Source {
 
 /// A unit shown to the user and selectable for deletion. Items never overlap:
 /// every counted byte belongs to exactly one Item.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub frn: u64,
-    pub path: PathBuf,       // volume-relative, e.g. \Users\me\AppData\Local\npm-cache
+    pub path: PathBuf,       // absolute, e.g. C:\Users\me\AppData\Local\npm-cache
     pub is_dir: bool,
     pub physical_size: u64,
     pub file_count: u64,

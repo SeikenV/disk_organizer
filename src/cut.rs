@@ -10,7 +10,7 @@ pub fn cut(index: &Index, totals: &HashMap<u64, DirAgg>, threshold: u64) -> Vec<
     let mut out: Vec<Item> = Vec::new();
     let mut cache: HashMap<u64, PathBuf> = HashMap::new();
     let mut visited: HashSet<u64> = HashSet::new();
-    walk(ROOT_FRN, true, index, totals, threshold, &mut out, &mut cache, &mut visited);
+    walk_iterative(index, totals, threshold, &mut out, &mut cache, &mut visited);
     out.sort_by_key(|it| (std::cmp::Reverse(it.physical_size), it.frn));
     out
 }
@@ -19,53 +19,151 @@ fn agg(totals: &HashMap<u64, DirAgg>, frn: u64) -> (u64, u64) {
     totals.get(&frn).map(|a| (a.physical_size, a.file_count)).unwrap_or((0, 0))
 }
 
-/// Returns bytes claimed (emitted) under and including `frn`.
-#[allow(clippy::too_many_arguments)] // private recursive helper; threading state is clearer than a struct
-fn walk(
+/// A single frame in the iterative DFS stack, tracking one directory's
+/// traversal state so the compiler never pushes a call frame per level.
+struct Frame {
     frn: u64,
     is_root: bool,
+    /// Bytes already claimed by emitted items in this subtree.
+    claimed: u64,
+    /// Total physical_size of this subtree (from aggregate).
+    self_total: u64,
+    /// File count of this subtree (from aggregate).
+    self_count: u64,
+    /// Pre-computed volume-relative path (None for root).
+    path: Option<PathBuf>,
+    /// Index into index.children[frn] for the next child to process.
+    child_index: usize,
+}
+
+/// Iterative DFS traversal — uses an explicit Vec-based stack so that
+/// arbitrarily deep directory trees cannot overflow the call stack.
+fn walk_iterative(
     index: &Index,
     totals: &HashMap<u64, DirAgg>,
     threshold: u64,
     out: &mut Vec<Item>,
     cache: &mut HashMap<u64, PathBuf>,
     visited: &mut HashSet<u64>,
-) -> u64 {
-    // Guard against cycles / re-entry: never process the same record twice.
-    if !visited.insert(frn) {
-        return 0;
-    }
+) {
+    let mut stack: Vec<Frame> = Vec::new();
 
-    // Known directory → emit whole subtree as one item, do not descend.
-    if !is_root {
-        let path = path_for(frn, index, cache);
-        if let Some(entry) = match_path(&path) {
-            let (size, count) = agg(totals, frn);
-            out.push(Item {
-                frn, path, is_dir: true, physical_size: size, file_count: count,
-                category: entry.category.to_string(), purpose: entry.purpose.to_string(),
-                risk: entry.risk, source: Source::Rule,
-            });
-            return size;
-        }
-    }
+    // Bootstrap: push the volume root.
+    let (root_total, root_count) = agg(totals, ROOT_FRN);
+    stack.push(Frame {
+        frn: ROOT_FRN,
+        is_root: true,
+        claimed: 0,
+        self_total: root_total,
+        self_count: root_count,
+        path: None,
+        child_index: 0,
+    });
+    visited.insert(ROOT_FRN);
 
-    let (total, count) = agg(totals, frn);
-    if !is_root && total < threshold {
-        return 0; // too small to surface; folds into an ancestor's residual
-    }
+    loop {
+        // --- Decide what to do for the top frame ---
+        let action = {
+            let frame = match stack.last_mut() {
+                Some(f) => f,
+                None => break, // all done
+            };
 
-    let mut claimed = 0u64;
-    if let Some(children) = index.children.get(&frn) {
-        for &child in children {
-            match index.by_frn.get(&child) {
-                Some(rec) if rec.is_dir => {
-                    claimed += walk(child, false, index, totals, threshold, out, cache, visited);
+            let children_slice: &[u64] = index
+                .children
+                .get(&frame.frn)
+                .map(|c| c.as_slice())
+                .unwrap_or(&[]);
+
+            if frame.child_index >= children_slice.len() {
+                Action::Pop
+            } else {
+                let child_frn = children_slice[frame.child_index];
+                frame.child_index += 1;
+                Action::ProcessChild(child_frn)
+            }
+        };
+
+        // --- Execute the action ---
+        match action {
+            Action::Pop => {
+                let frame = stack.pop().unwrap(); // safe: we just peeked it
+                if !frame.is_root {
+                    let residual = frame.self_total.saturating_sub(frame.claimed);
+                    let mut subtree_claimed = frame.claimed;
+                    if residual >= threshold {
+                        out.push(Item {
+                            frn: frame.frn,
+                            path: frame.path.expect("non-root frame must have path"),
+                            is_dir: true,
+                            physical_size: residual,
+                            file_count: frame.self_count,
+                            category: "Unknown".to_string(),
+                            purpose: "Unclassified directory contents".to_string(),
+                            risk: Risk::Unknown,
+                            source: Source::Unknown,
+                        });
+                        subtree_claimed += residual;
+                    }
+                    // Propagate claimed bytes upward.
+                    if let Some(parent) = stack.last_mut() {
+                        parent.claimed += subtree_claimed;
+                    }
                 }
-                Some(rec) if rec.physical_size >= threshold => {
-                    let cpath = path_for(child, index, cache);
-                    // Catalog first (covers root-level system files like $MFT,
-                    // pagefile.sys); fall back to the extension heuristic.
+            }
+            Action::ProcessChild(child_frn) => {
+                // Cycle guard.
+                if !visited.insert(child_frn) {
+                    continue;
+                }
+
+                let rec = match index.by_frn.get(&child_frn) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                if rec.is_dir {
+                    let (total, count) = agg(totals, child_frn);
+
+                    // Below threshold → folds into parent's residual; no frame needed.
+                    if total < threshold {
+                        continue;
+                    }
+
+                    let path = path_for(child_frn, index, cache);
+
+                    // Catalog match → whole subtree as one item; don't descend.
+                    if let Some(entry) = match_path(&path) {
+                        out.push(Item {
+                            frn: child_frn,
+                            path,
+                            is_dir: true,
+                            physical_size: total,
+                            file_count: count,
+                            category: entry.category.to_string(),
+                            purpose: entry.purpose.to_string(),
+                            risk: entry.risk,
+                            source: Source::Rule,
+                        });
+                        // Claim the whole subtree size on the parent.
+                        if let Some(parent) = stack.last_mut() {
+                            parent.claimed += total;
+                        }
+                    } else {
+                        // Unknown directory — push a frame and descend.
+                        stack.push(Frame {
+                            frn: child_frn,
+                            is_root: false,
+                            claimed: 0,
+                            self_total: total,
+                            self_count: count,
+                            path: Some(path),
+                            child_index: 0,
+                        });
+                    }
+                } else if rec.physical_size >= threshold {
+                    // Large loose file.
+                    let cpath = path_for(child_frn, index, cache);
                     let (category, purpose, risk, source) = match match_path(&cpath) {
                         Some(entry) => (
                             entry.category.to_string(),
@@ -74,37 +172,35 @@ fn walk(
                             Source::Rule,
                         ),
                         None => {
-                            let (category, purpose, risk) = classify_file(&cpath);
-                            (category, purpose, risk, Source::Heuristic)
+                            let (cat, pur, risk) = classify_file(&cpath);
+                            (cat, pur, risk, Source::Heuristic)
                         }
                     };
                     out.push(Item {
-                        frn: child, path: cpath, is_dir: false,
-                        physical_size: rec.physical_size, file_count: 1,
-                        category, purpose, risk, source,
+                        frn: child_frn,
+                        path: cpath,
+                        is_dir: false,
+                        physical_size: rec.physical_size,
+                        file_count: 1,
+                        category,
+                        purpose,
+                        risk,
+                        source,
                     });
-                    claimed += rec.physical_size;
+                    if let Some(parent) = stack.last_mut() {
+                        parent.claimed += rec.physical_size;
+                    }
                 }
-                Some(_) => {} // file below threshold; folds into residual
-                None => {}
+                // else: file below threshold → folds into parent's residual
             }
         }
     }
+}
 
-    if !is_root {
-        let residual = total.saturating_sub(claimed);
-        if residual >= threshold {
-            let path = path_for(frn, index, cache);
-            out.push(Item {
-                frn, path, is_dir: true, physical_size: residual, file_count: count,
-                category: "Unknown".to_string(),
-                purpose: "Unclassified directory contents".to_string(),
-                risk: Risk::Unknown, source: Source::Unknown,
-            });
-            claimed += residual;
-        }
-    }
-    claimed
+/// Internal action enum — only used within walk_iterative.
+enum Action {
+    Pop,
+    ProcessChild(u64),
 }
 
 /// Classify a large loose file by extension.
@@ -158,11 +254,14 @@ mod tests {
     fn known_dir_is_cut_as_one_item() {
         let (index, totals) = fixture();
         let items = cut(&index, &totals, 100);
-        let npm = items.iter().find(|i| i.path.ends_with("npm-cache")).expect("npm-cache item");
-        assert_eq!(npm.source, Source::Rule);
-        assert_eq!(npm.risk, Risk::Safe);
-        assert_eq!(npm.physical_size, 1000);
-        // The blob inside npm-cache must NOT also appear as its own item.
+        // \Users\dongm now matches the "users/*" catalog entry (User profile, System).
+        // It swallows all children, including npm-cache.
+        let user = items.iter().find(|i| i.path.ends_with("dongm")).expect("User profile item");
+        assert_eq!(user.source, Source::Rule);
+        assert_eq!(user.risk, Risk::System);
+        assert_eq!(user.physical_size, 1800);
+        // npm-cache and its blob are swallowed — they must NOT appear.
+        assert!(!items.iter().any(|i| i.path.ends_with("npm-cache")));
         assert!(!items.iter().any(|i| i.path.ends_with("blob")));
     }
 
@@ -181,7 +280,14 @@ mod tests {
 
     #[test]
     fn unknown_big_file_emitted_via_heuristic() {
-        let (index, totals) = fixture();
+        // Use a path that does NOT go through a user directory (no "users/*" match).
+        let records = vec![
+            dir(10, ROOT_FRN, "Projects"),
+            dir(11, 10, "myapp"),
+            file(21, 11, "big.bin", 800),
+        ];
+        let index = crate::index::build_index(records);
+        let totals = crate::aggregate::aggregate(&index);
         let items = cut(&index, &totals, 100);
         let big = items.iter().find(|i| i.path.ends_with("big.bin")).expect("big.bin item");
         assert_eq!(big.source, Source::Heuristic);

@@ -44,6 +44,7 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "users/*/pictures", category: "Pictures", purpose: "User pictures; review before deleting", risk: Caution },
         CatalogEntry { pattern: "users/*/documents", category: "Documents", purpose: "User documents; review before deleting", risk: Caution },
         CatalogEntry { pattern: "users/*/desktop", category: "Desktop", purpose: "Desktop files; review before deleting", risk: Caution },
+        CatalogEntry { pattern: "users/*", category: "User profile", purpose: "User home directory with personal files and settings; do NOT delete the entire profile", risk: System },
         // --- system (System: never delete) ---
         CatalogEntry { pattern: "windows/winsxs", category: "Windows component store", purpose: "Servicing store (hardlinked); manage via DISM only", risk: System },
         CatalogEntry { pattern: "windows/system32", category: "Windows system files", purpose: "Core OS files; do not delete", risk: System },
@@ -54,6 +55,8 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "swapfile.sys", category: "Swap file", purpose: "System swap file; managed by Windows", risk: System },
         CatalogEntry { pattern: "$mft", category: "Master File Table", purpose: "NTFS metadata; do not delete", risk: System },
         CatalogEntry { pattern: "program files/windowsapps", category: "Store apps", purpose: "Installed Store apps; uninstall via Settings, not by deleting", risk: System },
+        // --- git repositories (Caution) ---
+        CatalogEntry { pattern: ".git", category: "Git repository data", purpose: "Git version control database (objects, refs, history); removing loses commit history — re-clone from remote to restore", risk: Caution },
     ]
 }
 
@@ -123,5 +126,19 @@ mod tests {
         assert_eq!(match_path(Path::new(r"\$MFT")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\System Volume Information")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\Windows\Installer")).unwrap().risk, Risk::Caution);
+    }
+
+    #[test]
+    fn matches_git_dir_anywhere() {
+        let e = match_path(Path::new(r"\Users\dongm\github\myproject\.git")).unwrap();
+        assert_eq!(e.category, "Git repository data");
+        assert_eq!(e.risk, Risk::Caution);
+    }
+
+    #[test]
+    fn matches_user_profile_root() {
+        let e = match_path(Path::new(r"\Users\dongm")).unwrap();
+        assert_eq!(e.category, "User profile");
+        assert_eq!(e.risk, Risk::System);
     }
 }
