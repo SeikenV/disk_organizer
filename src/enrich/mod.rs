@@ -23,10 +23,10 @@ pub use llm::{DirSummary, FinalReport};
 
 // ---- Re-export centralized constants (convenience for intra-module use) ----
 use crate::consts::{
-    CWND_INIT, CWND_LINEAR_DECR, CWND_MIN,
+    CWND_INIT, CWND_MIN,
     MAX_RETRIES, MAX_SAFETY_CWND,
     PROBE_INTERVAL, RETRY_BASE_DELAY,
-    SRTT_GROW_THRESHOLD, SRTT_RECOVER_THRESHOLD, SRTT_SHRINK_THRESHOLD,
+    VEGAS_ALPHA, VEGAS_BETA,
 };
 
 // ---- Configuration ----
@@ -92,17 +92,6 @@ struct WorkItem {
 
 // ---- Probe record types ----
 
-/// What the supervisor decided in a single probe cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-enum ProbeDecision {
-    /// Throughput improved — cwnd was doubled (growth phase) or nudged up (steady).
-    Grow,
-    /// Throughput within noise band — no change.
-    Steady,
-    /// Throughput dropped significantly — cwnd was reduced linearly.
-    Shrink,
-}
-
 /// One row in the probe log, written every PROBE_INTERVAL by the supervisor.
 #[derive(Debug, Clone, serde::Serialize)]
 struct ProbeRecord {
@@ -112,45 +101,40 @@ struct ProbeRecord {
     completed_in_window: usize,
     throughput_rps: f64,
     srtt_ms: f64,
+    /// Vegas base_rtt — current minimum observed latency (ms).
+    base_rtt_ms: f64,
     /// Effective per-task completion pacing in this window (ms).
-    /// Computed as PROBE_INTERVAL / max(completed_in_window, 1).
-    /// Useful for judging whether more concurrency actually speeds up
-    /// individual task completion.
     per_task_ms: f64,
-    decision: ProbeDecision,
-    /// Whether the supervisor was still in growth (exponential) phase.
-    growth_phase: bool,
-    /// The peak throughput the steady phase compares against.
-    peak_throughput_rps: f64,
-    /// Human-readable explanation of why the decision was made.
-    reason: String,
+    /// Vegas estimated queue depth (jobs).
+    est_queue: f64,
+    /// Vegas decision: "grow", "shrink", or "steady".
+    vegas_action: String,
 }
 
-// ---- Cwnd: sliding-window throughput-probe concurrency control ----
+// ---- Cwnd: Vegas concurrency control ----
 //
-// Design:
-//   Workers acquire/release permits; they do NOT adjust cwnd themselves.
-//   A dedicated supervisor thread runs every PROBE_INTERVAL:
-//     1. Counts how many requests completed in this window → throughput.
-//     2. Growth phase: double cwnd while throughput keeps improving (> GROW_THRESHOLD × prev).
-//        Once throughput stops improving, we've found the GPU saturation point.
-//     3. Steady phase: slow adaptation (±1/8 cwnd) based on throughput vs peak.
-//        A significant drop (> SHRINK_THRESHOLD below peak) triggers a halving.
-//   This is inspired by TCP slow-start but driven by aggregate throughput
-//   rather than per-request latency, which handles the high variance of LLM
-//   prompt lengths much more smoothly.
+// Design (TCP Vegas, adapted for LLM workload):
+//   Workers acquire/release permits via blocking Condvar (unchanged).
+//   Every successful request feeds a latency sample to the Vegas estimator
+//   which continuously tracks base_rtt (minimum observed latency) and uses
+//   estimated queue depth to decide cwnd adjustments.
+//
+//   base_rtt is NOT frozen — it tracks the running minimum of all successful
+//   latency samples, so cwnd naturally grows as the model warms up and
+//   individual request latency drops.
 
 struct CwndCtl {
-    /// Current concurrency window — written ONLY by the supervisor.
+    /// Current concurrency window — written by Vegas update after each request.
     cwnd: AtomicUsize,
     /// Currently in-flight requests.
     inflight: AtomicUsize,
     /// Condition variable + mutex: workers wait here instead of spin-looping.
-    /// Supervisor/release signals when a permit may have freed up.
     permit_mutex: Mutex<()>,
     permit_cv: Condvar,
-    /// Smoothed round-trip time (ms).  Updated by workers on success.
+    /// Smoothed round-trip time (ms). EWMA, for display only.
     srtt_ms: Mutex<f64>,
+    /// Vegas base_rtt — minimum observed successful latency (ms).
+    vegas_base_rtt_ms: Mutex<f64>,
     /// Requests completed since last probe snapshot (workers inc, supervisor resets).
     completed_this_window: AtomicUsize,
     /// Peak inflight observed (for final summary).
@@ -159,7 +143,7 @@ struct CwndCtl {
     peak_cwnd: AtomicUsize,
     /// Probe log — supervisor appends one record per cycle.
     probe_log: Mutex<Vec<ProbeRecord>>,
-    /// Wall-clock instant when this controller was created (for elapsed-ms in log).
+    /// Wall-clock instant when this controller was created.
     start: Instant,
 }
 
@@ -171,9 +155,10 @@ impl CwndCtl {
             permit_mutex: Mutex::new(()),
             permit_cv: Condvar::new(),
             srtt_ms: Mutex::new(0.0),
+            vegas_base_rtt_ms: Mutex::new(0.0),
             completed_this_window: AtomicUsize::new(0),
             peak_inflight: AtomicUsize::new(0),
-            peak_cwnd: AtomicUsize::new(0),
+            peak_cwnd: AtomicUsize::new(CWND_INIT),
             probe_log: Mutex::new(Vec::new()),
             start: Instant::now(),
         }
@@ -211,17 +196,98 @@ impl CwndCtl {
         }
     }
 
-    /// Report a successful completion.  Workers call this; does NOT adjust cwnd.
+    /// Report a successful completion.  Workers call this; Vegas adjusts cwnd.
     fn release_success(&self, latency_ms: f64) {
         self.inflight.fetch_sub(1, Ordering::SeqCst);
         self.completed_this_window.fetch_add(1, Ordering::Relaxed);
-        let mut srtt = self.srtt_ms.lock().unwrap();
-        if *srtt == 0.0 {
-            *srtt = latency_ms;
-        } else {
-            *srtt = 0.875 * *srtt + 0.125 * latency_ms;
+
+        // Update SRTT EWMA (for display).
+        {
+            let mut srtt = self.srtt_ms.lock().unwrap();
+            if *srtt == 0.0 {
+                *srtt = latency_ms;
+            } else {
+                *srtt = 0.875 * *srtt + 0.125 * latency_ms;
+            }
         }
+
+        // Vegas congestion control — per-sample update.
+        self.vegas_update(latency_ms);
+
         self.permit_cv.notify_one();
+    }
+
+    /// Vegas congestion control: estimate queue depth, adjust cwnd.
+    ///
+    /// Uses TCP Vegas logic adapted for LLM workloads:
+    /// - base_rtt = running minimum latency (NOT frozen — continuously updated)
+    /// - est_queue = (in_flight / latency) × (latency - base_rtt)
+    /// - Grow when est_queue < α × log₁₀(cwnd)
+    /// - Shrink when est_queue > β × log₁₀(cwnd)
+    #[allow(clippy::cast_precision_loss)]
+    fn vegas_update(&self, latency_ms: f64) {
+        let cwnd = self.cwnd.load(Ordering::Relaxed);
+        let inflight = self.inflight.load(Ordering::Relaxed).max(1); // snapshot after release
+
+        let mut base = self.vegas_base_rtt_ms.lock().unwrap();
+
+        // Track minimum observed latency — this is the key fix: base_rtt is
+        // continuously updated, so cwnd can grow as the model warms up.
+        if *base == 0.0 {
+            *base = latency_ms;
+            return; // first sample, no decision yet
+        }
+        if latency_ms < *base {
+            *base = latency_ms;
+            // New lower baseline — potentially room to grow.
+            // Fall through to normal evaluation.
+        }
+
+        let extra_latency = latency_ms - *base;
+        if extra_latency <= 0.0 {
+            return; // at or below baseline, no congestion signal
+        }
+
+        // throughput = inflight / latency (jobs per ms)
+        // est_queue = throughput × extra_latency  (estimated queued jobs)
+        let throughput = inflight as f64 / latency_ms.max(0.001);
+        let est_queue = throughput * extra_latency;
+
+        // Thresholds scale with log₁₀(cwnd) — more slack at higher cwnd.
+        let log_cwnd = (cwnd as f64).log10().max(1.0);
+        let alpha = VEGAS_ALPHA * log_cwnd;
+        let beta = VEGAS_BETA * log_cwnd;
+
+        let new_cwnd = if est_queue > beta {
+            // Congestion: too many queued jobs.
+            cwnd.saturating_sub(1).max(CWND_MIN)
+        } else if est_queue < alpha {
+            // Headroom: room to increase concurrency.
+            (cwnd + 1).min(MAX_SAFETY_CWND)
+        } else {
+            // Sweet spot: alpha..=beta band, no change.
+            cwnd
+        };
+
+        if new_cwnd != cwnd {
+            self.cwnd.store(new_cwnd, Ordering::Relaxed);
+
+            // Track peak cwnd.
+            let mut p = self.peak_cwnd.load(Ordering::Relaxed);
+            while new_cwnd > p {
+                match self.peak_cwnd.compare_exchange_weak(
+                    p, new_cwnd, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => p = v,
+                }
+            }
+
+            // Wake blocked workers if cwnd increased.
+            if new_cwnd > cwnd {
+                self.permit_cv.notify_all();
+            }
+        }
     }
 
     /// Report a failed completion (after all retries exhausted).
@@ -243,237 +309,34 @@ impl CwndCtl {
         *self.srtt_ms.lock().unwrap()
     }
 
-    /// Wake all workers blocked on `acquire()`.  Called by the supervisor after
-    /// cwnd is increased, and by release methods.
+    fn base_rtt(&self) -> f64 {
+        *self.vegas_base_rtt_ms.lock().unwrap()
+    }
+
+    /// Wake all workers blocked on `acquire()`.  Used by the supervisor
+    /// after cwnd is increased, and by tests.
+    #[allow(dead_code)]
     fn notify_waiters(&self) {
         self.permit_cv.notify_all();
     }
 }
 
-// ---- Supervisor: sliding-window throughput probe ----
+// ---- Supervisor: periodic progress print + probe log ----
 
-/// Runs the sliding-window supervisor for one or two backends.
+/// Runs the supervisor for one or two backends.
 ///
-/// Every PROBE_INTERVAL the supervisor:
-/// 1. Snapshots `completed_this_window` → computes per-window throughput.
-/// 2. Decides GROW / STEADY / SHRINK for each backend independently.
-/// 3. Logs the decision into `CwndCtl.probe_log`.
-/// 4. Prints a combined progress line.
-// ---- Per-backend probe state (stack-local, single-threaded) ----
-struct ProbeState {
-    last_completed: usize,
-    growth_phase: bool,
-    /// SRTT snapshot from before the most recent cwnd doubling.
-    srtt_before_grow: f64,
-    /// Baseline SRTT for steady phase (established at the end of growth).
-    srtt_steady_baseline: f64,
-    /// Whether the next probe should evaluate a pending cwnd doubling.
-    pending_eval: bool,
-    /// cwnd value before the most recent doubling (for rollback on overshoot).
-    cwnd_before_grow: usize,
-    /// Completions-per-window before the most recent doubling (to verify actual benefit).
-    completed_before_grow: usize,
-}
-
-impl ProbeState {
-    fn new() -> Self {
-        Self {
-            last_completed: 0,
-            growth_phase: true,
-            srtt_before_grow: 0.0,
-            srtt_steady_baseline: 0.0,
-            pending_eval: false,
-            cwnd_before_grow: 0,
-            completed_before_grow: 0,
-        }
-    }
-}
-
-/// Core probe logic for one backend — returns decision + appends to probe log.
+/// Every PROBE_INTERVAL the supervisor snapshots cwnd/inflight/srtt/base_rtt
+/// and appends a record to the probe log.  It does NOT make any congestion
+/// control decisions — Vegas handles that per-sample in `release_success()`.
 ///
-/// SRTT-based congestion control + completion-throughput verification:
-///   Growth: double cwnd (capped at `min(total, 2^16)`), wait one window,
-///           evaluate both SRTT < baseline×2.0 AND completed_in_window improved.
-///           If yes → continue doubling. If no → rollback, enter steady.
-///   Steady: shrink if SRTT > baseline × 3.0 (real congestion).
-///           grow if SRTT < baseline × 0.7 (headroom available).
-///           otherwise stay at current cwnd.
-fn probe_one(ctl: &CwndCtl, state: &mut ProbeState, total: usize) -> ProbeDecision {
-    let completed_now = ctl.completed_this_window.load(Ordering::Relaxed);
-    let completed_in_window = completed_now.saturating_sub(state.last_completed);
-    state.last_completed = completed_now;
-
-    let window_throughput =
-        completed_in_window as f64 / PROBE_INTERVAL.as_secs_f64();
-    let current_cwnd = ctl.cwnd.load(Ordering::Relaxed);
-    // Snapshot inflight at the same instant as cwnd — avoids the confusing
-    // "infl > cwnd" display artifact when the supervisor already bumped cwnd
-    // and workers grabbed new slots before we read inflight.
-    let snapshot_inflight = ctl.inflight.load(Ordering::Relaxed);
-    let srtt = ctl.srtt();
-
-    // Dynamic cap: min(total tasks, 2^16).  Don't let cwnd exceed the number
-    // of items that can actually benefit from concurrency.
-    let cwnd_limit = total.min(MAX_SAFETY_CWND);
-
-    // Helper to bump cwnd and wake workers.
-    let grow_cwnd = |ctl: &CwndCtl, limit: usize, current: usize| -> usize {
-        let next = (current * 2).min(limit);
-        if next > current {
-            ctl.cwnd.store(next, Ordering::Relaxed);
-            ctl.notify_waiters();
-            // Track peak cwnd.
-            let mut p = ctl.peak_cwnd.load(Ordering::Relaxed);
-            while next > p {
-                match ctl.peak_cwnd.compare_exchange_weak(
-                    p, next, Ordering::Relaxed, Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(v) => p = v,
-                }
-            }
-        }
-        next
-    };
-
-    let (decision, reason) = if state.growth_phase {
-        if srtt == 0.0 {
-            // No latency samples yet — wait for first completions.
-            let r = format!("no SRTT data at cwnd={current_cwnd}, waiting for completions");
-            (ProbeDecision::Steady, r)
-        } else if state.pending_eval {
-            // We doubled cwnd last cycle. Evaluate latency AND completions.
-            let srtt_ok = srtt < state.srtt_before_grow * SRTT_GROW_THRESHOLD;
-            // If baseline completions is 0 we can't judge improvement;
-            // fall through to SRTT-only verdict in that case.
-            let more_done = state.completed_before_grow == 0
-                || completed_in_window > state.completed_before_grow;
-
-            if srtt_ok && more_done {
-                // Both latency OK and completions improved → GROW was beneficial.
-                let prev_cwnd = current_cwnd;
-                let next = grow_cwnd(ctl, cwnd_limit, current_cwnd);
-                state.srtt_before_grow = srtt;
-                state.cwnd_before_grow = prev_cwnd;
-                state.completed_before_grow = completed_in_window;
-                let r = format!(
-                    "SRTT {srtt:.0}ms OK, done/w {completed_in_window}↑, GROW cwnd {current_cwnd}→{next}"
-                );
-                (ProbeDecision::Grow, r)
-            } else {
-                // Either latency spiked or completions didn't improve → overshoot.
-                let next = state.cwnd_before_grow;
-                ctl.cwnd.store(next, Ordering::Relaxed);
-                state.growth_phase = false;
-                state.srtt_steady_baseline = state.srtt_before_grow;
-                state.pending_eval = false;
-                let reason_detail = if !srtt_ok {
-                    format!(
-                        "SRTT {srtt:.0}ms >= {:.0}ms",
-                        state.srtt_before_grow * SRTT_GROW_THRESHOLD
-                    )
-                } else {
-                    format!(
-                        "done/w {completed_in_window} <= prev {}",
-                        state.completed_before_grow
-                    )
-                };
-                let r = format!(
-                    "{reason_detail}, overshot — rollback {current_cwnd}→{next}, enter steady"
-                );
-                (ProbeDecision::Shrink, r)
-            }
-        } else {
-            // Ready to try doubling. Remember baseline (SRTT + completions) and double cwnd.
-            state.srtt_before_grow = srtt;
-            state.cwnd_before_grow = current_cwnd;
-            state.completed_before_grow = completed_in_window;
-            state.pending_eval = true;
-            let next = grow_cwnd(ctl, cwnd_limit, current_cwnd);
-            let r = format!(
-                "SRTT baseline {srtt:.0}ms (+{completed_in_window} done/w), GROW cwnd {current_cwnd}→{next}, eval next cycle"
-            );
-            (ProbeDecision::Grow, r)
-        }
-    } else {
-        // Steady phase: compare SRTT against baseline.
-        let baseline = state.srtt_steady_baseline;
-        let shrink_thr = baseline * SRTT_SHRINK_THRESHOLD;
-        let recover_thr = baseline * SRTT_RECOVER_THRESHOLD;
-
-        if srtt > shrink_thr {
-            let next = (current_cwnd.saturating_sub(CWND_LINEAR_DECR)).max(CWND_MIN);
-            ctl.cwnd.store(next, Ordering::Relaxed);
-            let r = format!(
-                "SRTT {srtt:.0}ms > {shrink_thr:.0}ms (baseline {baseline:.0}×{SRTT_SHRINK_THRESHOLD}), SHRINK cwnd {current_cwnd}→{next} (-{CWND_LINEAR_DECR})"
-            );
-            (ProbeDecision::Shrink, r)
-        } else if srtt < recover_thr {
-            let next =
-                (current_cwnd + (current_cwnd / 8).max(1)).min(cwnd_limit);
-            if next > current_cwnd {
-                ctl.cwnd.store(next, Ordering::Relaxed);
-                // Track peak cwnd (same CAS loop as grow_cwnd helper).
-                let mut p = ctl.peak_cwnd.load(Ordering::Relaxed);
-                while next > p {
-                    match ctl.peak_cwnd.compare_exchange_weak(
-                        p, next, Ordering::Relaxed, Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(v) => p = v,
-                    }
-                }
-                ctl.notify_waiters();
-            }
-            state.srtt_steady_baseline = srtt; // new baseline
-            let r = format!(
-                "SRTT {srtt:.0}ms < {recover_thr:.0}ms (baseline {baseline:.0}×{SRTT_RECOVER_THRESHOLD}), GROW cwnd {current_cwnd}→{next}"
-            );
-            (ProbeDecision::Grow, r)
-        } else {
-            let r = format!(
-                "SRTT {srtt:.0}ms in [{recover_thr:.0}, {shrink_thr:.0}] band, STEADY at cwnd={current_cwnd}"
-            );
-            (ProbeDecision::Steady, r)
-        }
-    };
-
-    // Log.
-    let baseline_srtt = if state.growth_phase {
-        state.srtt_before_grow
-    } else {
-        state.srtt_steady_baseline
-    };
-    let per_task_ms = if completed_in_window > 0 {
-        PROBE_INTERVAL.as_millis() as f64 / completed_in_window as f64
-    } else {
-        0.0
-    };
-    ctl.probe_log.lock().unwrap().push(ProbeRecord {
-        elapsed_ms: ctl.start.elapsed().as_millis() as u64,
-        cwnd: current_cwnd,
-        inflight: snapshot_inflight,
-        completed_in_window,
-        throughput_rps: window_throughput,
-        srtt_ms: srtt,
-        per_task_ms,
-        decision,
-        growth_phase: state.growth_phase,
-        peak_throughput_rps: baseline_srtt, // repurposed: baseline SRTT in ms
-        reason,
-    });
-
-    decision
-}
-
+/// The supervisor also prints periodic progress to stderr.
 fn run_supervisor(
     gpu_ctl: &Arc<CwndCtl>,
     igpu_ctl: Option<&Arc<CwndCtl>>,
     total: usize,
     done: &Arc<AtomicUsize>,
 ) {
-    let mut gpu_state = ProbeState::new();
-    let mut igpu_state = igpu_ctl.map(|_| ProbeState::new());
+    let mut last_completed: usize = 0;
 
     loop {
         thread::sleep(PROBE_INTERVAL);
@@ -482,37 +345,87 @@ fn run_supervisor(
             break;
         }
 
-        let gpu_decision = probe_one(gpu_ctl, &mut gpu_state, total);
+        append_probe_log(gpu_ctl, total, &mut last_completed);
+
         let gpu_cwnd = gpu_ctl.cwnd.load(Ordering::Relaxed);
         let gpu_inf = gpu_ctl.inflight.load(Ordering::Relaxed);
         let gpu_srtt = gpu_ctl.srtt();
-        let gpu_phase = if gpu_state.growth_phase { "⇧" } else { "·" };
+        let gpu_base = gpu_ctl.base_rtt();
 
-        if let (Some(ictl), Some(ref mut istate)) = (igpu_ctl, &mut igpu_state) {
-            let _igpu_decision = probe_one(ictl, istate, total);
+        if let Some(ictl) = igpu_ctl {
+            append_probe_log(ictl, total, &mut last_completed);
             let icwnd = ictl.cwnd.load(Ordering::Relaxed);
             let iinf = ictl.inflight.load(Ordering::Relaxed);
             let isrtt = ictl.srtt();
-            let iphase = if istate.growth_phase { "⇧" } else { "·" };
+            let ibase = ictl.base_rtt();
             eprint!(
-                "\r  [{d}/{total}] dGPU cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms {gpu_phase} | iGPU cwnd={icwnd} infl={iinf} srtt={isrtt:.0}ms {iphase}  ",
+                "\r  [{d}/{total}] dGPU cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms base={gpu_base:.0}ms | iGPU cwnd={icwnd} infl={iinf} srtt={isrtt:.0}ms base={ibase:.0}ms  ",
             );
         } else {
-            let label = match gpu_decision {
-                ProbeDecision::Grow => "GROW ",
-                ProbeDecision::Shrink => "SHRINK",
-                ProbeDecision::Steady => "     ",
-            };
-            let baseline = if gpu_state.growth_phase {
-                gpu_state.srtt_before_grow
-            } else {
-                gpu_state.srtt_steady_baseline
-            };
             eprint!(
-                "\r  [{d}/{total}] cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms base={baseline:.0}ms {gpu_phase} {label}  ",
+                "\r  [{d}/{total}] cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms base={gpu_base:.0}ms  ",
             );
         }
     }
+}
+
+/// Snapshot the current state into the probe log for one backend.
+fn append_probe_log(ctl: &CwndCtl, total: usize, last_completed: &mut usize) {
+    let completed_now = ctl.completed_this_window.load(Ordering::Relaxed);
+    let completed_in_window = completed_now.saturating_sub(*last_completed);
+    *last_completed = completed_now;
+
+    let current_cwnd = ctl.cwnd.load(Ordering::Relaxed);
+    let snapshot_inflight = ctl.inflight.load(Ordering::Relaxed);
+    let srtt = ctl.srtt();
+    let base_rtt = ctl.base_rtt();
+    let window_throughput =
+        completed_in_window as f64 / PROBE_INTERVAL.as_secs_f64();
+    let per_task_ms = if completed_in_window > 0 {
+        PROBE_INTERVAL.as_millis() as f64 / completed_in_window as f64
+    } else {
+        0.0
+    };
+
+    // Compute Vegas est_queue for the log (approximate, using last known values).
+    let est_queue = if base_rtt > 0.0 && srtt > base_rtt {
+        let inf = snapshot_inflight.max(1) as f64;
+        let throughput = inf / srtt.max(0.001);
+        throughput * (srtt - base_rtt)
+    } else {
+        0.0
+    };
+
+    let log_cwnd = (current_cwnd as f64).log10().max(1.0);
+    let alpha = VEGAS_ALPHA * log_cwnd;
+    let beta = VEGAS_BETA * log_cwnd;
+    let action = if est_queue > beta {
+        "shrink"
+    } else if est_queue < alpha {
+        "grow"
+    } else {
+        "steady"
+    };
+
+    let max_cwnd = total.min(MAX_SAFETY_CWND);
+    let vegas_action = if current_cwnd >= max_cwnd {
+        "capped"
+    } else {
+        action
+    };
+
+    ctl.probe_log.lock().unwrap().push(ProbeRecord {
+        elapsed_ms: ctl.start.elapsed().as_millis() as u64,
+        cwnd: current_cwnd,
+        inflight: snapshot_inflight,
+        completed_in_window,
+        throughput_rps: window_throughput,
+        srtt_ms: srtt,
+        base_rtt_ms: base_rtt,
+        per_task_ms,
+        est_queue,
+        vegas_action: vegas_action.into(),
+    });
 }
 
 // ---- Public API ----
@@ -805,47 +718,38 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
         if !log.is_empty() {
             // --- stderr: compact table ---
             info!("");
-            info!("{}", "=".repeat(70));
-            info!("  PROBE LOG (SRTT-based congestion probe)");
-            info!("{}", "=".repeat(70));
+            info!("{}", "=".repeat(80));
+            info!("  PROBE LOG (Vegas congestion control)");
+            info!("{}", "=".repeat(80));
             info!(
-                "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>8} {:>6}",
-                "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "t/ms", "dec"
+                "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7}",
+                "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "base", "t/ms", "queue", "action"
             );
-            info!("  {}", "-".repeat(66));
+            info!("  {}", "-".repeat(76));
             for r in log.iter() {
-                let dec_str = match r.decision {
-                    ProbeDecision::Grow => "GROW",
-                    ProbeDecision::Steady => "STEADY",
-                    ProbeDecision::Shrink => "SHRINK",
-                };
                 info!(
-                    "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>7.0} {:>6}",
+                    "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>6.0} {:>7.0} {:>7.1} {:>7}",
                     r.elapsed_ms, r.cwnd, r.inflight, r.completed_in_window,
-                    r.throughput_rps, r.srtt_ms, r.per_task_ms, dec_str,
+                    r.throughput_rps, r.srtt_ms, r.base_rtt_ms, r.per_task_ms,
+                    r.est_queue, r.vegas_action,
                 );
             }
-            info!("{}", "=".repeat(70));
+            info!("{}", "=".repeat(80));
 
-            // --- Disk: detailed table with reason column ---
+            // --- Disk: detailed table ---
             if let Some(ref mut rep) = report {
-                let _ = rep.section("PROBE LOG (detailed)");
+                let _ = rep.section("PROBE LOG (Vegas congestion control)");
                 let _ = rep.line(&format!(
-                    "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>8} {:>6} {:>6} {}",
-                    "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "t/ms", "phase", "dec", "reason"
+                    "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7}",
+                    "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "base", "t/ms", "queue", "action"
                 ));
-                let _ = rep.line(&format!("  {}", "-".repeat(100)));
+                let _ = rep.line(&format!("  {}", "-".repeat(76)));
                 for r in log.iter() {
-                    let ph = if r.growth_phase { "GROWTH" } else { "steady" };
-                    let dec_str = match r.decision {
-                        ProbeDecision::Grow => "GROW  ",
-                        ProbeDecision::Steady => "STEADY",
-                        ProbeDecision::Shrink => "SHRINK",
-                    };
                     let _ = rep.line(&format!(
-                        "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>7.0} {:>6} {:>6} {}",
+                        "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>6.0} {:>7.0} {:>7.1} {:>7}",
                         r.elapsed_ms, r.cwnd, r.inflight, r.completed_in_window,
-                        r.throughput_rps, r.srtt_ms, r.per_task_ms, ph, dec_str, r.reason,
+                        r.throughput_rps, r.srtt_ms, r.base_rtt_ms, r.per_task_ms,
+                        r.est_queue, r.vegas_action,
                     ));
                 }
 
@@ -1270,53 +1174,289 @@ mod tests {
         }
     }
 
+    // ===================================================================
+    //  CwndCtl — init (Vegas)
+    // ===================================================================
+
     #[test]
-    fn probe_one_growth_respects_task_limit() {
-        // cwnd cap = min(total, 2^16).  total=80 → cap=80.
-        let ctl = ctl_with_srtt(10, 64, 500.0);
-        let mut state = ProbeState::new();
-        // First grow: 64→80 (capped at task limit, not 128).
-        let d = probe_one(&ctl, &mut state, 80);
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 80);
+    fn cwndctl_init_defaults() {
+        let ctl = CwndCtl::new();
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT);
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(ctl.srtt(), 0.0);
+        assert_eq!(ctl.base_rtt(), 0.0);
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), CWND_INIT);
+        assert!(ctl.probe_log.lock().unwrap().is_empty());
+    }
+
+    // ===================================================================
+    //  CwndCtl — acquire / release (single-threaded)
+    // ===================================================================
+
+    #[test]
+    fn cwndctl_acquire_increments_inflight() {
+        let ctl = CwndCtl::new();
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
+        ctl.acquire();
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn probe_one_growth_stops_when_no_completion_improvement() {
-        // completed_in_window=1 before grow, still 1 after grow → enter steady.
-        let ctl = ctl_with_srtt(5, 8, 500.0);
-        let mut state = ProbeState::new();
-        // Probe 1: first growth with completed_in_window=5.
-        probe_one(&ctl, &mut state, 10000);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16);
-        assert_eq!(state.completed_before_grow, 5);
-        // Probe 2: SRTT OK but completed_in_window stayed at 5 (delta 0).
-        // Set completed_this_window to 5 (same as before) → delta=0.
-        ctl.completed_this_window.store(5, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 510.0; // < 1000, SRTT OK
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Shrink); // rolled back to cwnd_before_grow=8
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 8);
-        assert!(!state.growth_phase);
+    fn cwndctl_release_success_decrements_inflight() {
+        let ctl = CwndCtl::new();
+        ctl.acquire();
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 1);
+        ctl.release_success(100.0);
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn probe_one_growth_with_zero_completed_before_skip_check() {
-        // If completed_before_grow is 0, we skip the completion check.
-        // This happens when the very first SRTT window had 0 completions.
-        let ctl = ctl_with_srtt(0, 8, 500.0);
-        let mut state = ProbeState::new();
-        // First probe: SRTT has data, completed_in_window=0. Set completed_before_grow=0.
-        let d1 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d1, ProbeDecision::Grow);
-        assert_eq!(state.completed_before_grow, 0);
-        // Probe 2: SRTT OK, still 0 completions. Since completed_before_grow==0,
-        // the completion check is skipped → only SRTT matters → GROW continues.
-        *ctl.srtt_ms.lock().unwrap() = 510.0; // < 1000
-        let d2 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d2, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 32);
-        assert!(state.growth_phase);
+    fn cwndctl_release_failure_decrements_inflight() {
+        let ctl = CwndCtl::new();
+        ctl.acquire();
+        ctl.release_failure();
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cwndctl_acquires_up_to_cwnd_before_blocking() {
+        let ctl = CwndCtl::new();
+        for _ in 0..CWND_INIT {
+            ctl.acquire();
+        }
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
+        ctl.release_success(50.0);
+        ctl.acquire();
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
+    }
+
+    #[test]
+    fn cwndctl_acquire_blocks_when_cwnd_zero() {
+        let ctl = Arc::new(CwndCtl::new());
+        ctl.cwnd.store(0, Ordering::Relaxed);
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let done_clone = Arc::clone(&done);
+        let ctl_clone = Arc::clone(&ctl);
+
+        let h = thread::spawn(move || {
+            ctl_clone.acquire();
+            done_clone.store(1, Ordering::Relaxed);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(done.load(Ordering::Relaxed), 0);
+
+        ctl.cwnd.store(1, Ordering::Relaxed);
+        ctl.notify_waiters();
+
+        h.join().unwrap();
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+    }
+
+    // ===================================================================
+    //  CwndCtl — peak tracking
+    // ===================================================================
+
+    #[test]
+    fn cwndctl_peak_inflight_tracks_max() {
+        let ctl = CwndCtl::new();
+        ctl.cwnd.store(4, Ordering::Relaxed);
+        ctl.notify_waiters();
+        ctl.acquire();
+        ctl.acquire();
+        ctl.acquire();
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 3);
+        ctl.release_success(50.0);
+        ctl.release_success(50.0);
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn cwndctl_peak_inflight_persists_below_current() {
+        let ctl = CwndCtl::new();
+        ctl.cwnd.store(8, Ordering::Relaxed);
+        ctl.notify_waiters();
+        for _ in 0..8 {
+            ctl.acquire();
+        }
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
+        for _ in 0..8 {
+            ctl.release_success(50.0);
+        }
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
+        ctl.acquire();
+        ctl.acquire();
+        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
+    }
+
+    // ===================================================================
+    //  CwndCtl — SRTT (EWMA)
+    // ===================================================================
+
+    #[test]
+    fn cwndctl_srtt_first_sample_sets_directly() {
+        let ctl = CwndCtl::new();
+        assert_eq!(ctl.srtt(), 0.0);
+        ctl.release_success(250.0);
+        assert!((ctl.srtt() - 250.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cwndctl_srtt_ewma_converges() {
+        let ctl = CwndCtl::new();
+        ctl.release_success(100.0);
+        ctl.release_success(200.0);
+        let expected = 0.875 * 100.0 + 0.125 * 200.0;
+        assert!((ctl.srtt() - expected).abs() < 0.001);
+        ctl.release_success(112.5);
+        let expected2 = 0.875 * expected + 0.125 * 112.5;
+        assert!((ctl.srtt() - expected2).abs() < 0.001);
+    }
+
+    #[test]
+    fn cwndctl_release_failure_does_not_update_srtt() {
+        let ctl = CwndCtl::new();
+        ctl.release_success(100.0);
+        assert!((ctl.srtt() - 100.0).abs() < 0.001);
+        ctl.release_failure();
+        assert!((ctl.srtt() - 100.0).abs() < 0.001);
+    }
+
+    // ===================================================================
+    //  Vegas congestion control — base_rtt tracking
+    // ===================================================================
+
+    #[test]
+    fn vegas_base_rtt_tracks_minimum() {
+        let ctl = CwndCtl::new();
+        ctl.acquire();
+        ctl.release_success(2000.0);
+        assert!((ctl.base_rtt() - 2000.0).abs() < 0.01);
+
+        ctl.acquire();
+        ctl.release_success(1500.0);
+        assert!((ctl.base_rtt() - 1500.0).abs() < 0.01); // dropped
+
+        ctl.acquire();
+        ctl.release_success(1800.0);
+        assert!((ctl.base_rtt() - 1500.0).abs() < 0.01); // no change, 1800 > 1500
+    }
+
+    #[test]
+    fn vegas_zero_base_rtt_no_decision() {
+        // First sample just sets base_rtt, doesn't change cwnd.
+        let ctl = CwndCtl::new();
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT);
+        ctl.acquire();
+        ctl.release_success(1000.0);
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT); // cwnd unchanged
+        assert!((ctl.base_rtt() - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn vegas_update_drops_base_rtt_then_grows_cwnd() {
+        // base_rtt starts at 2000ms (cold), then drops to ~1000ms (warm).
+        // cwnd should grow once samples are above the new lower baseline.
+        let ctl = CwndCtl::new();
+        ctl.cwnd.store(4, Ordering::Relaxed);
+
+        // First: establish high baseline (cold start).
+        ctl.acquire();
+        ctl.release_success(2000.0);
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 4); // first sample, no decision
+        assert!((ctl.base_rtt() - 2000.0).abs() < 0.01);
+
+        // Second: latency drops below baseline → base_rtt drops to new minimum.
+        ctl.acquire();
+        ctl.release_success(1010.0);
+        assert!((ctl.base_rtt() - 1010.0).abs() < 0.01); // base dropped
+        // cwnd may not change because extra_latency ≈ 0 on the drop sample.
+
+        // Third: latency slightly above new baseline → est_queue tiny → grow.
+        ctl.acquire();
+        ctl.release_success(1020.0);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) > 4,
+            "cwnd should grow on 3rd sample, got {}", ctl.cwnd.load(Ordering::Relaxed));
+    }
+
+    // ===================================================================
+    //  Vegas congestion control — queue estimation
+    // ===================================================================
+
+    /// Helper: create a CwndCtl pre-seeded with base_rtt and SRTT.
+    fn ctl_with_vegas_state(base_rtt: f64, cwnd_val: usize, srtt_val: f64) -> CwndCtl {
+        let ctl = CwndCtl::new();
+        *ctl.vegas_base_rtt_ms.lock().unwrap() = base_rtt;
+        ctl.cwnd.store(cwnd_val, Ordering::Relaxed);
+        if srtt_val > 0.0 {
+            *ctl.srtt_ms.lock().unwrap() = srtt_val;
+        }
+        ctl
+    }
+
+    #[test]
+    fn vegas_grows_when_queue_is_low() {
+        // base=500, latency=510 (near baseline) → est_queue ≈ 0 → grow.
+        let ctl = ctl_with_vegas_state(500.0, 4, 510.0);
+        ctl.inflight.store(4, Ordering::Relaxed); // simulate inflight
+        ctl.vegas_update(510.0);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) > 4, "expected cwnd to grow, got {}", ctl.cwnd.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn vegas_shrinks_when_queue_is_high() {
+        // base=500, latency=2200 → est_queue > beta=6 → shrink.
+        // inflight=8, throughput=8/2200≈0.00364, extra=1700, est_queue≈6.18
+        let ctl = ctl_with_vegas_state(500.0, 8, 2200.0);
+        ctl.inflight.store(8, Ordering::Relaxed);
+        ctl.vegas_update(2200.0);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) < 8,
+            "expected cwnd to shrink, got {}", ctl.cwnd.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn vegas_steady_when_queue_in_band() {
+        // cwnd=4 (log10(clamped to 1), alpha=3, beta=6), base=500, latency=2000.
+        // inflight=4, throughput=4/2000=0.002, extra=1500, est_queue=0.002*1500=3.0.
+        // est_queue=3.0 == alpha → not < alpha → not grow.
+        // est_queue=3.0 < beta=6 → not > beta → not shrink. → STEADY.
+        let ctl = ctl_with_vegas_state(500.0, 4, 2000.0);
+        ctl.inflight.store(4, Ordering::Relaxed);
+        ctl.vegas_update(2000.0);
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 4,
+            "expected steady cwnd=4, got {}", ctl.cwnd.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn vegas_respects_cwnd_min() {
+        let ctl = ctl_with_vegas_state(500.0, CWND_MIN, 2000.0);
+        ctl.inflight.store(CWND_MIN, Ordering::Relaxed);
+        ctl.vegas_update(2000.0);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) >= CWND_MIN);
+    }
+
+    #[test]
+    fn vegas_respects_cwnd_max() {
+        // cwnd must never exceed MAX_SAFETY_CWND.
+        // Start just below max — if it grows, it caps at MAX_SAFETY_CWND.
+        let near_max = MAX_SAFETY_CWND - 1;
+        let ctl = ctl_with_vegas_state(500.0, near_max, 510.0);
+        ctl.inflight.store(near_max, Ordering::Relaxed);
+        ctl.vegas_update(510.0);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) <= MAX_SAFETY_CWND,
+            "cwnd must not exceed MAX_SAFETY_CWND");
+    }
+
+    #[test]
+    fn vegas_tracks_peak_cwnd() {
+        let ctl = ctl_with_vegas_state(500.0, 4, 500.0);
+        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), CWND_INIT);
+        ctl.inflight.store(4, Ordering::Relaxed);
+        ctl.vegas_update(510.0);
+        let peak = ctl.peak_cwnd.load(Ordering::Relaxed);
+        assert!(peak >= ctl.cwnd.load(Ordering::Relaxed));
     }
 
     // ===================================================================
@@ -1410,172 +1550,7 @@ mod tests {
     }
 
     // ===================================================================
-    //  CwndCtl — initialisation
-    // ===================================================================
-
-    #[test]
-    fn cwndctl_init_defaults() {
-        let ctl = CwndCtl::new();
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT);
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
-        assert_eq!(ctl.srtt(), 0.0);
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 0);
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), 0);
-        assert!(ctl.probe_log.lock().unwrap().is_empty());
-    }
-
-    // ===================================================================
-    //  CwndCtl — acquire / release (single-threaded)
-    // ===================================================================
-
-    #[test]
-    fn cwndctl_acquire_increments_inflight() {
-        let ctl = CwndCtl::new();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
-        ctl.acquire();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn cwndctl_release_success_decrements_inflight() {
-        let ctl = CwndCtl::new();
-        ctl.acquire();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 1);
-        ctl.release_success(100.0);
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn cwndctl_release_failure_decrements_inflight() {
-        let ctl = CwndCtl::new();
-        ctl.acquire();
-        ctl.release_failure();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn cwndctl_acquires_up_to_cwnd_before_blocking() {
-        // CWND_INIT is 2 — we can acquire exactly that many.
-        let ctl = CwndCtl::new();
-        for _ in 0..CWND_INIT {
-            ctl.acquire();
-        }
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
-        // One release, then it's possible to acquire again.
-        ctl.release_success(50.0);
-        ctl.acquire();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
-    }
-
-    #[test]
-    fn cwndctl_acquire_blocks_when_cwnd_zero() {
-        // Manually set cwnd to 0 → acquire must block.
-        let ctl = Arc::new(CwndCtl::new());
-        ctl.cwnd.store(0, Ordering::Relaxed);
-
-        let done = Arc::new(AtomicUsize::new(0));
-        let done_clone = Arc::clone(&done);
-        let ctl_clone = Arc::clone(&ctl);
-
-        let h = thread::spawn(move || {
-            ctl_clone.acquire();
-            done_clone.store(1, Ordering::Relaxed);
-        });
-
-        // Give the spawned thread a moment to start spinning.
-        thread::sleep(Duration::from_millis(50));
-        // Should still be blocked.
-        assert_eq!(done.load(Ordering::Relaxed), 0);
-
-        // Unblock: raise cwnd to 1 and wake the waiting thread.
-        ctl.cwnd.store(1, Ordering::Relaxed);
-        ctl.notify_waiters();
-
-        h.join().unwrap();
-        assert_eq!(done.load(Ordering::Relaxed), 1);
-    }
-
-    // ===================================================================
-    //  CwndCtl — peak tracking
-    // ===================================================================
-
-    #[test]
-    fn cwndctl_peak_inflight_tracks_max() {
-        let ctl = CwndCtl::new();
-        // Bump cwnd so we can acquire 3 without blocking.
-        ctl.cwnd.store(4, Ordering::Relaxed);
-        ctl.notify_waiters();
-        ctl.acquire();
-        ctl.acquire();
-        ctl.acquire();
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 3);
-        ctl.release_success(50.0);
-        ctl.release_success(50.0);
-        // Peak should still be 3 even after releasing 2.
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn cwndctl_peak_inflight_persists_below_current() {
-        let ctl = CwndCtl::new();
-        // Bump cwnd to 8 for this test.
-        ctl.cwnd.store(8, Ordering::Relaxed);
-        ctl.notify_waiters();
-        // Acquire all 8.
-        for _ in 0..8 {
-            ctl.acquire();
-        }
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
-        // Release all.
-        for _ in 0..8 {
-            ctl.release_success(50.0);
-        }
-        // Peak should still be 8.
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
-        // Now acquire only 2 — peak stays at 8.
-        ctl.acquire();
-        ctl.acquire();
-        assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 8);
-    }
-
-    // ===================================================================
-    //  CwndCtl — SRTT (Exponential Weighted Moving Average)
-    // ===================================================================
-
-    #[test]
-    fn cwndctl_srtt_first_sample_sets_directly() {
-        let ctl = CwndCtl::new();
-        assert_eq!(ctl.srtt(), 0.0);
-        ctl.release_success(250.0);
-        assert!((ctl.srtt() - 250.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn cwndctl_srtt_ewma_converges() {
-        let ctl = CwndCtl::new();
-        ctl.release_success(100.0);
-        // srtt = 100
-        ctl.release_success(200.0);
-        // srtt = 0.875*100 + 0.125*200 = 87.5 + 25 = 112.5
-        let expected = 0.875 * 100.0 + 0.125 * 200.0;
-        assert!((ctl.srtt() - expected).abs() < 0.001);
-        // Third sample.
-        ctl.release_success(112.5);
-        let expected2 = 0.875 * expected + 0.125 * 112.5;
-        assert!((ctl.srtt() - expected2).abs() < 0.001);
-    }
-
-    #[test]
-    fn cwndctl_release_failure_does_not_update_srtt() {
-        let ctl = CwndCtl::new();
-        ctl.release_success(100.0);
-        assert!((ctl.srtt() - 100.0).abs() < 0.001);
-        ctl.release_failure(); // should NOT change srtt
-        assert!((ctl.srtt() - 100.0).abs() < 0.001);
-    }
-
-    // ===================================================================
-    //  CwndCtl — completed_this_window counter
+    //  completed_this_window counter
     // ===================================================================
 
     #[test]
@@ -1588,293 +1563,6 @@ mod tests {
         assert_eq!(ctl.completed_this_window.load(Ordering::Relaxed), 2);
         ctl.release_success(50.0);
         assert_eq!(ctl.completed_this_window.load(Ordering::Relaxed), 3);
-    }
-
-    // ===================================================================
-    //  probe_one — growth phase (SRTT-based)
-    // ===================================================================
-
-    /// Helper: create CwndCtl with N completed items, a custom cwnd, and an SRTT value.
-    fn ctl_with_srtt(completed: usize, cwnd_val: usize, srtt_val: f64) -> CwndCtl {
-        let ctl = CwndCtl::new();
-        ctl.completed_this_window
-            .store(completed, Ordering::Relaxed);
-        ctl.cwnd.store(cwnd_val, Ordering::Relaxed);
-        if srtt_val > 0.0 {
-            *ctl.srtt_ms.lock().unwrap() = srtt_val;
-        }
-        ctl
-    }
-
-    #[test]
-    fn probe_one_no_srtt_is_steady() {
-        // srtt==0 → no latency samples → Steady (wait for completions).
-        let ctl = ctl_with_srtt(5, 8, 0.0);
-        let mut state = ProbeState::new();
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Steady);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 8);
-        assert!(state.growth_phase);
-        assert!(!state.pending_eval);
-    }
-
-    #[test]
-    fn probe_one_first_growth_doubles_cwnd() {
-        // First probe with SRTT data: record baseline, double cwnd, pending_eval=true.
-        let ctl = ctl_with_srtt(4, 8, 500.0);
-        let mut state = ProbeState::new();
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16);
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), 16);
-        assert!(state.growth_phase);
-        assert!(state.pending_eval);
-        assert!((state.srtt_before_grow - 500.0).abs() < 0.01);
-        assert_eq!(state.cwnd_before_grow, 8);
-    }
-
-    #[test]
-    fn probe_one_consecutive_growth_doubles_until_saturation() {
-        let ctl = ctl_with_srtt(4, 8, 500.0);
-        let mut state = ProbeState::new();
-
-        // Probe 1: first growth → double to 16.
-        probe_one(&ctl, &mut state, 10000);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16);
-
-        // Probe 2: SRTT still 500ms < 1000ms (2×500) → GROW to 32.
-        ctl.completed_this_window.store(12, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        probe_one(&ctl, &mut state, 10000);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 32);
-
-        // Probe 3: SRTT still 500ms < 1000ms → GROW to 64.
-        ctl.completed_this_window.store(28, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        probe_one(&ctl, &mut state, 10000);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 64);
-    }
-
-    #[test]
-    fn probe_one_growth_stops_when_srtt_doubles() {
-        // SRTT jumps from 500→1050ms (> 1000 threshold) → overshoot, rollback.
-        let ctl = ctl_with_srtt(4, 8, 500.0);
-        let mut state = ProbeState::new();
-
-        // Probe 1: first growth → double to 16.
-        probe_one(&ctl, &mut state, 10000);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16);
-
-        // Probe 2: SRTT 1050 >= 1000 (2×500) → SHRINK rollback to 8, enter steady.
-        ctl.completed_this_window.store(12, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 1050.0;
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Shrink);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 8); // rolled back
-        assert!(!state.growth_phase);
-        assert!(!state.pending_eval);
-        assert!((state.srtt_steady_baseline - 500.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn probe_one_growth_does_not_exceed_safety_cap() {
-        let near_max = MAX_SAFETY_CWND / 2 + 1;
-        let ctl = ctl_with_srtt(100, near_max, 500.0);
-        let mut state = ProbeState::new();
-        let d = probe_one(&ctl, &mut state, MAX_SAFETY_CWND);
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), MAX_SAFETY_CWND);
-    }
-
-    #[test]
-    fn probe_one_growth_tracks_peak_cwnd() {
-        let ctl = ctl_with_srtt(10, 8, 500.0);
-        let mut state = ProbeState::new();
-        probe_one(&ctl, &mut state, 10000); // cwnd → 16
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), 16);
-        // Simulate successful eval → grow to 32 (need completed_in_window increase).
-        ctl.completed_this_window.store(25, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        probe_one(&ctl, &mut state, 10000); // cwnd → 32
-        assert!(ctl.peak_cwnd.load(Ordering::Relaxed) >= 32);
-    }
-
-    // ===================================================================
-    //  probe_one — steady phase (SRTT-based)
-    // ===================================================================
-
-    fn steady_state(baseline_srtt: f64) -> ProbeState {
-        ProbeState {
-            last_completed: 10,
-            growth_phase: false,
-            srtt_before_grow: 0.0,
-            srtt_steady_baseline: baseline_srtt,
-            pending_eval: false,
-            cwnd_before_grow: 0,
-            completed_before_grow: 0,
-        }
-    }
-
-    #[test]
-    fn probe_one_steady_grow_on_low_srtt() {
-        // baseline=500, srtt=300 < 425 (0.85×500) → Grow +1/8.
-        let ctl = ctl_with_srtt(70, 64, 300.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 72); // 64 + 8
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), 72); // peak tracked
-        // baseline updated.
-        assert!((state.srtt_steady_baseline - 300.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn probe_one_steady_shrink_on_high_srtt() {
-        // baseline=500, srtt=1600 > 1500 (3.0×500) → Shrink, linear backoff.
-        let ctl = ctl_with_srtt(40, 64, 1600.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Shrink);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 63); // 64 - CWND_LINEAR_DECR(1)
-    }
-
-    #[test]
-    fn probe_one_steady_no_change_in_band() {
-        // baseline=500, srtt=500 → in (425, 1500) → Steady.
-        let ctl = ctl_with_srtt(55, 64, 500.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Steady);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 64);
-    }
-
-    #[test]
-    fn probe_one_steady_at_recover_boundary_is_steady() {
-        // Exactly at 0.85 × 500 = 425 → still Steady (not below).
-        let ctl = ctl_with_srtt(45, 64, 425.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Steady);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 64);
-    }
-
-    #[test]
-    fn probe_one_steady_at_shrink_boundary_is_steady() {
-        // Exactly at 3.0 × 500 = 1500 → still Steady (not above).
-        let ctl = ctl_with_srtt(45, 64, 1500.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Steady);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 64);
-    }
-
-    #[test]
-    fn probe_one_shrink_respects_cwnd_min() {
-        // cwnd=2 → 2-2=0 → clamped to CWND_MIN (2).
-        let ctl = ctl_with_srtt(10, 2, 2000.0);
-        let mut state = steady_state(500.0);
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Shrink);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_MIN);
-    }
-
-    #[test]
-    fn probe_one_steady_grow_respects_safety_cap() {
-        let near_max = MAX_SAFETY_CWND - 5;
-        let ctl = ctl_with_srtt(100, near_max, 100.0);
-        let mut state = steady_state(500.0); // 100 < 350 → Grow
-        let d = probe_one(&ctl, &mut state, MAX_SAFETY_CWND);
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), MAX_SAFETY_CWND);
-    }
-
-    // ===================================================================
-    //  probe_one — probe log
-    // ===================================================================
-
-    #[test]
-    fn probe_one_appends_record_to_log() {
-        let ctl = ctl_with_srtt(5, 8, 500.0);
-        let mut state = ProbeState::new();
-        probe_one(&ctl, &mut state, 10000);
-
-        let log = ctl.probe_log.lock().unwrap();
-        assert_eq!(log.len(), 1);
-        let r = &log[0];
-        assert_eq!(r.cwnd, 8);
-        assert_eq!(r.completed_in_window, 5);
-        assert!(r.throughput_rps > 0.0);
-        assert_eq!(r.decision, ProbeDecision::Grow);
-    }
-
-    #[test]
-    fn probe_one_multiple_calls_appends_multiple_records() {
-        let ctl = ctl_with_srtt(3, 8, 500.0);
-        let mut state = ProbeState::new();
-        probe_one(&ctl, &mut state, 10000); // GROW → 16, pending_eval=true
-
-        ctl.completed_this_window.store(12, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        probe_one(&ctl, &mut state, 10000); // GROW → 32
-
-        ctl.completed_this_window.store(28, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        probe_one(&ctl, &mut state, 10000); // GROW → 64
-
-        let log = ctl.probe_log.lock().unwrap();
-        assert_eq!(log.len(), 3);
-        assert_eq!(log[0].completed_in_window, 3);
-        assert_eq!(log[1].completed_in_window, 9); // 12-3
-        assert_eq!(log[2].completed_in_window, 16); // 28-12
-    }
-
-    #[test]
-    fn probe_one_record_contains_correct_decision_string() {
-        let ctl = ctl_with_srtt(4, 8, 500.0);
-        let mut state = ProbeState::new();
-        let d = probe_one(&ctl, &mut state, 10000);
-        let log = ctl.probe_log.lock().unwrap();
-        assert_eq!(log[0].decision, d);
-    }
-
-    // ===================================================================
-    //  probe_one — multi-transition scenario (integrated)
-    // ===================================================================
-
-    #[test]
-    fn probe_one_full_lifecycle_growth_to_steady_to_shrink() {
-        // --- Growth phase ---
-        let ctl = ctl_with_srtt(4, 8, 500.0);
-        let mut state = ProbeState::new();
-
-        // Cycle 1: First growth → double to 16.
-        let d1 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d1, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16);
-
-        // Cycle 2: SRTT still good → continue growing to 32.
-        ctl.completed_this_window.store(12, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 500.0;
-        let d2 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d2, ProbeDecision::Grow);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 32);
-
-        // Cycle 3: SRTT jumps to 1100ms (>= 1000 threshold) → overshoot, rollback.
-        ctl.completed_this_window.store(28, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 1100.0;
-        let d3 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d3, ProbeDecision::Shrink);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 16); // rolled back
-        assert!(!state.growth_phase);
-
-        // --- Steady phase ---
-        // Baseline is now 500ms (the srtt_before_grow from the last successful doubling).
-        // Cycle 4: SRTT spikes to 2000ms > 1500 (3×500) → Shrink, linear backoff.
-        ctl.completed_this_window.store(30, Ordering::Relaxed);
-        *ctl.srtt_ms.lock().unwrap() = 2000.0;
-        let d4 = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d4, ProbeDecision::Shrink);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 15); // 16 - CWND_LINEAR_DECR(1)
     }
 
     // ===================================================================
@@ -1894,14 +1582,7 @@ mod tests {
         });
 
         h.join().unwrap();
-        // Should exit very quickly (one PROBE_INTERVAL sleep).
-        // Actually it sleeps first, then checks. So it takes ~500ms.
-        // But with total=0, done=0, done >= total → break immediately after first sleep.
-
-        // Verify at least one probe record exists (it sleeps first, then probes).
         let log = ctl.probe_log.lock().unwrap();
-        // After the first 500ms sleep, done(0) >= total(0) → breaks before probe.
-        // So log should be empty.
         assert!(log.is_empty());
     }
 
@@ -1918,21 +1599,17 @@ mod tests {
             run_supervisor(&ctl_clone, None, total, &done_clone);
         });
 
-        // Simulate work completing: increment done after each probe window.
-        // The supervisor sleeps 500ms then probes.
         thread::sleep(Duration::from_millis(100));
         done.store(3, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(600));
         done.store(7, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(600));
-        done.store(10, Ordering::Relaxed); // >= total → supervisor exits
+        done.store(10, Ordering::Relaxed);
 
         h.join().unwrap();
 
         let log = ctl.probe_log.lock().unwrap();
-        // Should have 2-3 probe records (depends on timing).
         assert!(log.len() >= 2, "expected >=2 probes, got {}", log.len());
-        // All throughput should be zero since no real work was done.
         for r in log.iter() {
             assert_eq!(r.throughput_rps, 0.0);
         }
@@ -1944,20 +1621,17 @@ mod tests {
 
     #[test]
     fn selective_repeat_delays_are_exponential() {
-        // delay = RETRY_BASE_DELAY * 2^attempt
         let expected: Vec<Duration> = (0..3)
             .map(|a| RETRY_BASE_DELAY * 2u32.pow(a))
             .collect();
-        assert_eq!(expected[0], Duration::from_millis(200)); // 200 * 1
-        assert_eq!(expected[1], Duration::from_millis(400)); // 200 * 2
-        assert_eq!(expected[2], Duration::from_millis(800)); // 200 * 4
+        assert_eq!(expected[0], Duration::from_millis(200));
+        assert_eq!(expected[1], Duration::from_millis(400));
+        assert_eq!(expected[2], Duration::from_millis(800));
     }
 
     #[test]
     fn selective_repeat_max_retries_is_4_attempts() {
-        // MAX_RETRIES=3 means 0,1,2,3 → 4 total attempts (initial + 3 retries).
         assert_eq!(MAX_RETRIES, 3);
-        // 0..=MAX_RETRIES has MAX_RETRIES+1 elements.
         let attempts: Vec<u32> = (0..=MAX_RETRIES).collect();
         assert_eq!(attempts.len(), 4);
         assert_eq!(*attempts.last().unwrap(), 3);
@@ -1979,7 +1653,6 @@ mod tests {
             let h = thread::spawn(move || {
                 for _ in 0..n_ops {
                     c.acquire();
-                    // Simulate work (tiny sleep).
                     thread::sleep(Duration::from_micros(100));
                     c.release_success(10.0);
                 }
@@ -1991,9 +1664,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        // All releases must have happened: inflight should be 0.
         assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
-        // Total completions = n_threads * n_ops.
         assert_eq!(
             ctl.completed_this_window.load(Ordering::Relaxed),
             n_threads * n_ops
@@ -2002,13 +1673,11 @@ mod tests {
 
     #[test]
     fn cwndctl_cwnd_change_during_load() {
-        // One thread cycles cwnd between 1 and 16 while workers are running.
         let ctl = Arc::new(CwndCtl::new());
         let ctl2 = Arc::clone(&ctl);
         let stop = Arc::new(AtomicUsize::new(0));
         let stop2 = Arc::clone(&stop);
 
-        // Changer thread.
         let changer = thread::spawn(move || {
             let mut toggle = false;
             while stop2.load(Ordering::Relaxed) == 0 {
@@ -2022,7 +1691,6 @@ mod tests {
             }
         });
 
-        // Workers.
         let mut workers = vec![];
         for _ in 0..4 {
             let c = Arc::clone(&ctl);
@@ -2055,7 +1723,6 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for _ in 0..n {
                     c.acquire();
-                    // no sleep — fast acquire/release to stress atomics
                     c.release_success(1.0);
                 }
             }));
@@ -2078,29 +1745,17 @@ mod tests {
         assert!(CWND_INIT >= CWND_MIN);
         assert!(CWND_MIN >= 2);
         assert!(MAX_SAFETY_CWND > CWND_INIT);
-        // MAX_WORKER_THREADS is tested via compile-time assert in consts.rs.
         assert!(MAX_SAFETY_CWND <= 65536);
-        assert!(SRTT_GROW_THRESHOLD > 1.0);
-        assert!(SRTT_SHRINK_THRESHOLD > SRTT_GROW_THRESHOLD);
-        assert!(SRTT_RECOVER_THRESHOLD < 1.0);
-        assert!(SRTT_RECOVER_THRESHOLD > 0.0);
+        assert!(VEGAS_ALPHA > 0.0);
+        assert!(VEGAS_BETA > VEGAS_ALPHA);
         assert!(MAX_RETRIES <= 5);
         assert_eq!(RETRY_BASE_DELAY, Duration::from_millis(200));
         assert!(PROBE_INTERVAL >= Duration::from_millis(100));
     }
 
     // ===================================================================
-    //  ProbeRecord / ProbeDecision — Debug impls
+    //  ProbeRecord construction
     // ===================================================================
-
-    #[test]
-    fn probe_decision_has_expected_variants() {
-        // Ensure the enum has all three expected variants.
-        let d = ProbeDecision::Grow;
-        assert_eq!(d, ProbeDecision::Grow);
-        assert_ne!(d, ProbeDecision::Steady);
-        assert_ne!(d, ProbeDecision::Shrink);
-    }
 
     #[test]
     fn probe_record_construction() {
@@ -2111,11 +1766,10 @@ mod tests {
             completed_in_window: 8,
             throughput_rps: 16.0,
             srtt_ms: 2500.0,
-            per_task_ms: 62.5, // 500ms / 8
-            decision: ProbeDecision::Grow,
-            growth_phase: true,
-            peak_throughput_rps: 8.0,
-            reason: "test".into(),
+            base_rtt_ms: 1000.0,
+            per_task_ms: 62.5,
+            est_queue: 2.5,
+            vegas_action: "grow".into(),
         };
         assert_eq!(r.elapsed_ms, 500);
         assert_eq!(r.cwnd, 16);
@@ -2123,39 +1777,9 @@ mod tests {
         assert_eq!(r.completed_in_window, 8);
         assert!((r.throughput_rps - 16.0).abs() < 0.01);
         assert!((r.srtt_ms - 2500.0).abs() < 0.01);
+        assert!((r.base_rtt_ms - 1000.0).abs() < 0.01);
         assert!((r.per_task_ms - 62.5).abs() < 0.01);
-        assert_eq!(r.decision, ProbeDecision::Grow);
-    }
-
-    // ===================================================================
-    //  Edge cases — throughput calculation
-    // ===================================================================
-
-    #[test]
-    fn probe_one_throughput_is_exact_dividing_by_probe_interval() {
-        // 5 completions / 0.5s = 10 rps
-        let ctl = ctl_with_srtt(5, 8, 500.0);
-        let mut state = ProbeState::new();
-        probe_one(&ctl, &mut state, 10000);
-        let log = ctl.probe_log.lock().unwrap();
-        assert!((log[0].throughput_rps - 10.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn probe_one_saturating_sub_handles_counter_wrap() {
-        // last_completed > current counter → saturating_sub gives 0.
-        let ctl = ctl_with_srtt(0, 8, 500.0);
-        let mut state = ProbeState {
-            last_completed: 5,
-            growth_phase: false,
-            srtt_before_grow: 0.0,
-            srtt_steady_baseline: 500.0,
-            pending_eval: false,
-            cwnd_before_grow: 0,
-            completed_before_grow: 0,
-        };
-        // srtt=500, baseline=500, in band (350,1500) → Steady.
-        let d = probe_one(&ctl, &mut state, 10000);
-        assert_eq!(d, ProbeDecision::Steady);
+        assert!((r.est_queue - 2.5).abs() < 0.01);
+        assert_eq!(r.vegas_action, "grow");
     }
 }

@@ -120,7 +120,7 @@ fn classify_request<'a>(
 ) -> GenerationRequest<'a> {
     GenerationRequest::new(model.to_string(), prompt.to_string())
         .system(system.to_string())
-        .think(false)
+        .think(true)
         .format(format)
         .options(default_opts())
         .keep_alive(keep_10m())
@@ -153,7 +153,7 @@ pub fn health_check(endpoint: &str) -> bool {
 pub fn preload_model(endpoint: &str, model: &str) -> Result<(), String> {
     let ollama = ollama_from_endpoint(endpoint);
     let req = GenerationRequest::new(model.to_string(), ".")
-        .think(false)
+        .think(true)
         .keep_alive(keep_10m());
     block_generate(&ollama, req)?;
     Ok(())
@@ -273,7 +273,7 @@ pub fn summarize_report(
     let ollama = ollama_from_endpoint(endpoint);
     let req = GenerationRequest::new(model.to_string(), user_prompt)
         .system(system_prompt_report())
-        .think(false)
+        .think(true)
         .format(report_format())
         .options(
             ModelOptions::default()

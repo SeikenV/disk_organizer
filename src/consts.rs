@@ -61,34 +61,33 @@ pub fn worker_thread_limit(total_work_items: usize) -> usize {
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 // ============================================================================
-//  SRTT-based congestion probe thresholds
+//  Vegas congestion control thresholds
 // ============================================================================
 //
-// Design (user's insight):
-//   After doubling cwnd, if latency < 2× previous latency, the new cwnd is valid.
-//   This directly captures the parallelism-to-latency trade-off: "can the server
-//   handle double the load without doubling latency?"
+// Design (TCP Vegas, adapted for LLM concurrency):
+//   After each request, compare observed latency against base_rtt (minimum
+//   observed latency, continuously updated).  Estimate queue depth:
 //
-// Growth phase:
-//   1. Record srtt_before at current cwnd.
-//   2. Double cwnd, wait one PROBE_INTERVAL.
-//   3. If srtt_now < srtt_before × SRTT_GROW_THRESHOLD → GROW, repeat.
-//      Otherwise → rollback, enter steady.
+//     throughput     = in_flight / latency
+//     extra_latency  = latency - base_rtt
+//     est_queue      = throughput × extra_latency
 //
-// Steady phase:
-//   - SRTT > baseline × SRTT_SHRINK_THRESHOLD → real congestion → SHRINK.
-//   - SRTT < baseline × SRTT_RECOVER_THRESHOLD → headroom → GROW (+1/8).
-//   - Otherwise → STEADY.
+//   Compare est_queue against dynamically-scaled thresholds:
+//     alpha(log_cwnd) = VEGAS_ALPHA × max(log10(cwnd), 1)
+//     beta (log_cwnd) = VEGAS_BETA  × max(log10(cwnd), 1)
+//
+//     est_queue < alpha → cwnd + 1   (headroom)
+//     est_queue > beta  → cwnd - 1   (congestion)
+//     otherwise         → cwnd unchanged
+//
+//   base_rtt is NOT frozen — it tracks the running minimum of all successful
+//   latency samples, so it naturally decreases as the model warms up.
 
-/// SRTT must stay below baseline × this factor for a cwnd doubling to be valid.
-/// "Latency < 2× after doubling cwnd" = server can handle the extra parallelism.
-pub const SRTT_GROW_THRESHOLD: f64 = 2.0;
+/// Multiplier for lower Vegas threshold α.
+pub const VEGAS_ALPHA: f64 = 3.0;
 
-/// SRTT above baseline × this factor indicates real congestion → shrink.
-pub const SRTT_SHRINK_THRESHOLD: f64 = 3.0;
-
-/// SRTT below baseline × this factor indicates headroom → can grow.
-pub const SRTT_RECOVER_THRESHOLD: f64 = 0.85;
+/// Multiplier for upper Vegas threshold β.
+pub const VEGAS_BETA: f64 = 6.0;
 
 // ============================================================================
 //  Selective Repeat (retry)
@@ -125,7 +124,6 @@ const _: () = {
     assert!(MAX_WORKER_THREADS > CWND_INIT);
     assert!(MAX_WORKER_THREADS <= 4096);
     assert!(MAX_SAFETY_CWND <= 65536);
-    assert!(SRTT_GROW_THRESHOLD > 1.0);
-    assert!(SRTT_SHRINK_THRESHOLD > SRTT_GROW_THRESHOLD);
-    assert!(SRTT_RECOVER_THRESHOLD < 1.0);
+    assert!(VEGAS_ALPHA > 0.0);
+    assert!(VEGAS_BETA > VEGAS_ALPHA);
 };
