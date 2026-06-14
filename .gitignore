@@ -9,6 +9,7 @@
 /logs
 enrichment_probe_log.json
 analysis_result.json
+enrichment_report_*.log
 
 # Local scan snapshots / output (contain personal disk listings)
 *.snapshot.json
