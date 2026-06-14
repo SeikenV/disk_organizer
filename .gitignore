@@ -3,6 +3,12 @@
 
 # Cloned upstream projects kept locally for reference only (not vendored into git)
 /references
+/ollama-rs
+
+# Runtime logs and probe/analysis outputs
+/logs
+enrichment_probe_log.json
+analysis_result.json
 
 # Local scan snapshots / output (contain personal disk listings)
 *.snapshot.json
