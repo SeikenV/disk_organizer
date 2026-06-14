@@ -3,10 +3,10 @@ use disk_organizer::aggregate::aggregate;
 use disk_organizer::cut::cut;
 use disk_organizer::enrich::{self, is_ollama_running, LlmConfig};
 use disk_organizer::index::build_index;
-use disk_organizer::model::RawRecord;
+use disk_organizer::model::{RawRecord, Source};
 use disk_organizer::report::{self, ReportFile};
 use disk_organizer::snapshot;
-use flexi_logger::{FileSpec, Logger, WriteMode};
+use flexi_logger::{Duplicate, FileSpec, Logger, WriteMode};
 use log::{info, warn, error};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -90,7 +90,28 @@ fn main() -> std::io::Result<()> {
     let index = build_index(records);
     let totals = aggregate(&index);
     let mut items = cut(&index, &totals, min);
-    items.truncate(args.top);
+    // Truncate by LLM-eligible count: items that need LLM analysis
+    // (Source::Unknown dirs + Source::Heuristic files) count toward `top`;
+    // Catalog/Rule-matched items are included in output but don't consume quota.
+    {
+        let mut llm_eligible = 0usize;
+        let mut take = 0usize;
+        for it in &items {
+            take += 1;
+            let needs_llm = if it.is_dir {
+                it.source == Source::Unknown
+            } else {
+                it.source == Source::Heuristic
+            };
+            if needs_llm {
+                llm_eligible += 1;
+            }
+            if llm_eligible >= args.top {
+                break;
+            }
+        }
+        items.truncate(take);
+    }
     timings.push(("classify", t0.elapsed()));
 
     // 2.1 Make all paths absolute (prepend drive letter).
@@ -166,14 +187,25 @@ fn main() -> std::io::Result<()> {
 
 fn init_logger(debug: bool) -> std::io::Result<()> {
     if debug {
+        // Debug mode (script default):
+        // - Primary: file with debug level → all detail for post-run analysis
+        // - Duplicate: stderr with info level → operator sees same messages as normal mode
+        // Log file lands in logs/ with a timestamp in the name.
+        let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
         Logger::try_with_str("debug")
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-            .log_to_stderr()
-            .log_to_file(FileSpec::default().basename("disk_organizer"))
+            .log_to_file(
+                FileSpec::default()
+                    .directory("logs")
+                    .basename("disk_organizer")
+                    .discriminant(now.to_string()),
+            )
+            .duplicate_to_stderr(Duplicate::Info)
             .write_mode(WriteMode::BufferAndFlush)
             .start()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     } else {
+        // Normal mode: info level to stderr, no file.
         Logger::try_with_env_or_str("info")
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
             .log_to_stderr()

@@ -19,7 +19,7 @@ pub fn analyze_directory_contents(items: &mut [Item], index: &Index) {
 }
 
 /// Produce a one-line summary of what's inside a directory.
-fn summarize_children(frn: u64, index: &Index) -> String {
+pub fn summarize_children(frn: u64, index: &Index) -> String {
     let children = match index.children.get(&frn) {
         Some(c) => c,
         None => return String::new(),

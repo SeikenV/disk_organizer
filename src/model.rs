@@ -41,6 +41,7 @@ pub enum Risk {
 pub enum Source {
     Rule,      // matched the catalog
     Heuristic, // file-extension guess
+    LLM,       // inferred by LLM enrichment
     Unknown,   // unclassified residual
 }
 

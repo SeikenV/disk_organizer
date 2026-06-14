@@ -27,6 +27,8 @@ use std::time::Duration;
 pub struct DirSummary {
     pub category: String,
     pub purpose: String,
+    /// LLM-assessed risk: "safe", "caution", "system", or "unknown".
+    pub risk: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +56,8 @@ struct DirSummarySchema {
     category: String,
     /// 1 sentence, include safe-to-delete assessment
     purpose: String,
+    /// Risk level: "safe" (can delete), "caution" (review first), "system" (never delete), "unknown" (uncertain)
+    risk: String,
 }
 
 #[allow(dead_code)]
@@ -120,7 +124,7 @@ fn classify_request<'a>(
 ) -> GenerationRequest<'a> {
     GenerationRequest::new(model.to_string(), prompt.to_string())
         .system(system.to_string())
-        .think(true)
+        .think(false)
         .format(format)
         .options(default_opts())
         .keep_alive(keep_10m())
@@ -166,6 +170,8 @@ pub fn summarize_dir(
     dir_path: &str,
     sample_entries: &[String],
     ancestor_context: Option<&str>,
+    size_mb: u64,
+    content_summary: &str,
 ) -> Result<DirSummary, String> {
     let samples_str = if sample_entries.is_empty() {
         "(empty)".to_string()
@@ -175,8 +181,14 @@ pub fn summarize_dir(
     let ancestor_line = ancestor_context
         .map(|c| format!("\nAncestor context: {c}"))
         .unwrap_or_default();
+    let size_line = format!("\nSize: {size_mb} MB");
+    let content_line = if content_summary.is_empty() {
+        String::new()
+    } else {
+        format!("\nContent summary: {content_summary}")
+    };
     let user = format!(
-        "Directory: {dir_path}{ancestor_line}\nSample contents:\n{samples_str}"
+        "Directory: {dir_path}{ancestor_line}{size_line}{content_line}\nSample contents:\n{samples_str}"
     );
     let system = system_prompt_dir();
 
@@ -195,6 +207,7 @@ pub fn summarize_file(
     sibling_files: &[String],
     ext: &str,
     ancestor_context: Option<&str>,
+    size_mb: u64,
 ) -> Result<DirSummary, String> {
     let sibs_str = if sibling_files.is_empty() {
         "(none)".to_string()
@@ -205,7 +218,7 @@ pub fn summarize_file(
         .map(|c| format!("\nAncestor context: {c}"))
         .unwrap_or_default();
     let user = format!(
-        "File: {file_path}\nExtension: .{ext}\nParent directory: {parent_dir}{ancestor_line}\nSibling files: {sibs_str}"
+        "File: {file_path}\nSize: {size_mb} MB\nExtension: .{ext}\nParent directory: {parent_dir}{ancestor_line}\nSibling files: {sibs_str}"
     );
     let system = system_prompt_file();
 
@@ -278,7 +291,12 @@ pub fn summarize_report(
         .options(
             ModelOptions::default()
                 .temperature(0.1_f32)
-                .num_predict(600),
+                // Cap output at 4096 tokens — -1 (unlimited) risks runaway
+                // generation that hits the timeout before producing valid JSON.
+                .num_predict(4096)
+                // Default 2048 is far too small — report prompt may be 15K+
+                // tokens (all categorized items).  32K gives breathing room.
+                .num_ctx(32768),
         )
         .keep_alive(keep_10m());
 
@@ -292,7 +310,27 @@ pub fn summarize_report(
     });
 
     match result {
-        Ok(Ok(resp)) => parse_final_report(&resp.response),
+        Ok(Ok(resp)) => {
+            // With `think: true`, qwen models fill BOTH `thinking`
+            // (reasoning) and `response` (final answer) when given
+            // sufficient token budget.  Fall back to `thinking` only
+            // when `response` is empty (e.g. token limit hit during
+            // the thinking phase).
+            let used_field = if resp.response.is_empty() { "thinking" } else { "response" };
+            let text: &str = if resp.response.is_empty() {
+                resp.thinking.as_deref().unwrap_or(&resp.response)
+            } else {
+                &resp.response
+            };
+            // Quick sanity log: which field, how long, and a peek at the start.
+            log::info!(
+                "[LLM] Report final response: used={used_field} len={} done={} preview={:.80}",
+                text.len(),
+                resp.done,
+                text.chars().take(80).collect::<String>(),
+            );
+            parse_final_report(text)
+        }
         Ok(Err(e)) => Err(format!("Ollama error: {e}")),
         Err(_elapsed) => Err("Report generation timed out".to_string()),
     }
@@ -301,16 +339,144 @@ pub fn summarize_report(
 // ---- System prompts ----
 
 fn system_prompt_dir() -> String {
-    "\
-Classify the directory. You MUST output valid JSON matching the schema.
-Rules: C:\\Users\\X→keep. project(src/,Cargo.toml,.git/)→keep. cache/node_modules/venv/build/target/dist→safe delete. Be specific."
+    r#"You are a Windows disk cleanup analyzer. Given a directory path, its size,
+content summary, and sample child names, classify it and describe its purpose.
+Output valid JSON matching the schema: {"category": "...", "purpose": "...", "risk": "..."}.
+Use Chinese for labels.
+
+IMPORTANT: Do NOT assume every CAUTION item is "game data" or "Steam". Consider
+the full variety of reasons a directory may require review: drivers, professional
+software, old projects, hardware utilities, SDK toolchains, installers.
+
+## Risk guidelines
+
+### SAFE to delete
+- Build/cache artifacts: target/ build/ dist/ out/ obj/ generated/ __pycache__/
+- Package manager dirs: node_modules/ .venv/ venv/ vendor/ packages/ .npm/
+- Temp & cache: .cache/ cache/ tmp/ temp/ Temp/ .temp/
+- Log dirs: logs/ _logs/ log/ — directories dominated by .log files
+- IDE caches (NOT config): .idea/ .vs/ .vscode-server/ — transient data
+- Crash dumps, stale download caches, browser temp data
+- Driver extraction directories: C:\AMD\ C:\NVIDIA\ C:\Intel\ — left by driver installers
+- Shader/precompiled caches: dxcache/ glcache/ compiled/
+- Windows maintenance caches: Prefetch, WinSxS\ManifestCache
+
+### CAUTION — review before deleting
+- Large downloaded archives/dirs (>500 MB total)
+- Old backup dirs: backup_... old_... archive_... Copy of ...
+- Old git repos or abandoned side projects you may no longer need
+- Versioned SDKs/tools with multiple versions (keep the latest)
+- Game data — often large but re-downloadable
+- OEM driver installation packages (e.g. eSupport\eDriver) — only delete after confirming drivers work
+- GPU driver installer caches (e.g. AMD_Graphic..., NVIDIA DisplayDriver) — large, re-downloadable
+- Professional software data: Xilinx/Vivado IP cores, MATLAB toolboxes, old Altium versions
+- Hardware utility install data: ASUS ROG, MSI Dragon, Razer Synapse backup packages
+- Content creation caches: DaVinci Resolve render cache, Adobe Media Cache
+- MSI/WIX installer source caches (ProgramData\Package Cache)
+- Named-version application install dirs (e.g. app\2.3.4\) — keep latest, delete old
+
+### SYSTEM — do NOT delete
+- User profile root: C:\Users\X\ — the profile itself
+- Project source: dirs containing Cargo.toml package.json .git/ CMakeLists.txt
+- IDE user config: .codebuddy/ .cursor/ .vscode/ — user settings, not cache
+- Windows system: C:\Windows\ C:\Program Files\ C:\Program Files (x86)\ C:\ProgramData\
+- Active application data: AppData\Local\ (if belonging to software you use)
+- Development toolchains: Python/Rust/Go/Node.js installations
+- LaTeX distros (identified by texmf-dist/)
+- FPGA/EDA tool installations: Xilinx/ Altera/ Vivado/
+- Installed software under Program Files (unless clearly a versioned SDK with old copies)
+
+## Few-shot examples
+Path: C:\Users\dongm\AppData\Local\Temp\
+→ {"category": "临时文件", "purpose": "系统和应用临时文件，可安全删除", "risk": "safe"}
+
+Path: C:\Users\dongm\github\disk_organizer\target\
+→ {"category": "Rust构建产物", "purpose": "Cargo build输出，可安全删除的target目录", "risk": "safe"}
+
+Path: C:\Users\dongm\.codebuddy\
+→ {"category": "IDE用户数据", "purpose": "CodeBuddy AI助手的用户配置和数据，应保留", "risk": "system"}
+
+Path: D:\Steam\steamapps\common\OldGame\
+→ {"category": "游戏数据", "purpose": "Steam游戏安装目录，需确认是否仍玩后再决定删除", "risk": "caution"}
+
+Path: C:\eSupport\eDriver\Software\Driver\DCH\Online\Graphic\AMD\AMD_Graphic_DriverOnly_ROG\
+→ {"category": "AMD驱动安装包", "purpose": "ASUS笔记本AMD显卡驱动安装文件；确认驱动正常工作后可删除", "risk": "caution"}
+
+Path: C:\NVIDIA\DisplayDriver\528.02\
+→ {"category": "NVIDIA驱动解压目录", "purpose": "NVIDIA显卡驱动安装时留下的解压目录，可安全删除", "risk": "safe"}
+
+Path: C:\ProgramData\Package Cache\
+→ {"category": "MSI安装源缓存", "purpose": "WIX/MSI软件安装包缓存；已安装的软件对应的缓存可安全删除", "risk": "safe"}
+
+Path: C:\Program Files\NVIDIA Corporation\Installer2\
+→ {"category": "NVIDIA驱动缓存", "purpose": "NVIDIA驱动安装源缓存，驱动安装后可安全清理", "risk": "safe"}
+
+Path: D:\OldProjects\abandoned_web_demo_2022\
+→ {"category": "废弃项目", "purpose": "旧项目目录，确认不再需要后可删除备份后清理", "risk": "caution"}
+
+Path: C:\Program Files\Tencent\WeMeet\3.36.1.445\
+→ {"category": "腾讯会议旧版本", "purpose": "腾讯会议旧版安装目录，可保留最新版本删除旧版", "risk": "caution"}""#
         .to_string()
 }
 
 fn system_prompt_file() -> String {
-    "\
-Classify the file. You MUST output valid JSON matching the schema.
-Use path context. Don't restate extension. Be concise."
+    r#"You are a Windows disk cleanup analyzer. Given a file path, size, extension,
+parent directory, and sibling files, classify it and describe its purpose.
+Output valid JSON matching the schema: {"category": "...", "purpose": "...", "risk": "..."}.
+Use Chinese for labels.
+Do NOT restate the extension. Be concise.
+
+IMPORTANT: Do NOT assume large .exe/.msi files are "game installers" by default.
+Consider driver installers, SDK bundles, hardware utilities, and professional software.
+
+## Risk guidelines
+
+### SAFE to delete
+- Build intermediates: .o .obj .pdb .ilk .exp .lib (intermediate only)
+- Cache: .pyc .pyo .class
+- Logs: .log .etl .dump .dmp .mdmp
+- Temp: .tmp .temp .bak .swp .swo ~ (backup) files
+- Old download leftovers in Downloads/ or Temp/
+- Driver installation packages in root folders (C:\AMD\ C:\NVIDIA\ C:\Intel\) — left by driver installers
+
+### CAUTION
+- Large installers (>500 MB) — you may need them
+- .zip .rar .7z .tar .gz archives — check contents
+- .iso .vhd .vhdx disk images
+- .pst .ost Outlook data
+- Named backups: "Copy of ...", "... (backup)", "... (old)"
+- GPU driver installer .exe (e.g. *-desktop-win10-win11-64bit*.exe) — large but re-downloadable
+- SDK / toolchain installers (.exe .msi > 1GB) — check if the installed version is current
+- FPGA bitstream / IP core archive files
+- Professional software installer packages
+
+### SYSTEM
+- Source code: .rs .py .js .ts .c .cpp .h .java .go
+- Config: .json .yaml .yml .toml .ini .cfg .conf .env
+- Documents: .docx .xlsx .pptx .pdf (unless clearly outdated)
+- Project files: Cargo.toml package.json CMakeLists.txt Makefile
+- Database: .db .sqlite .sqlite3
+- Executables in Program Files/ or toolchain paths
+- System files in C:\Windows\ C:\ProgramData\
+
+## Few-shot examples
+Path: C:\Users\dongm\AppData\Local\Temp\DumpStack.log | 2MB | .log
+→ {"category": "临时日志", "purpose": "系统临时崩溃日志，可安全删除", "risk": "safe"}
+
+Path: C:\Users\dongm\Downloads\setup.exe | 150MB | .exe
+→ {"category": "下载的安装程序", "purpose": "下载目录中的安装包，安装后即可删除", "risk": "caution"}
+
+Path: D:\Projects\data\large_dataset.h5 | 2GB | .h5
+→ {"category": "大型数据文件", "purpose": "HDF5科学数据文件，需确认是否仍在使用后再决定", "risk": "caution"}
+
+Path: C:\AMD\AMD_Software_22.11.2.exe | 600MB | .exe
+→ {"category": "AMD驱动安装包", "purpose": "AMD显卡驱动安装包，安装完成后即可删除", "risk": "safe"}
+
+Path: C:\NVIDIA\528.02-desktop-win10-win11-64bit.exe | 800MB | .exe
+→ {"category": "NVIDIA驱动安装包", "purpose": "NVIDIA显卡驱动安装包，安装后可删除", "risk": "safe"}
+
+Path: C:\eSupport\eDriver\...\nvoptix.bi_ | 20MB | .bi_
+→ {"category": "NVIDIA组件文件", "purpose": "NVIDIA Optix光线追踪驱动组件，属于驱动安装包，可随驱动安装包删除", "risk": "safe"}""#
         .to_string()
 }
 
@@ -318,11 +484,29 @@ fn system_prompt_report() -> String {
     "\
 You are a disk cleanup advisor. Given categorized scan data, produce a cleanup plan.
 Output ONLY the JSON object with fields: overview, safe_summary, caution_advice, cleanup_plan.
-Use Chinese if the paths suggest a Chinese user."
+Use Chinese if the paths suggest a Chinese user.
+
+IMPORTANT: safe_summary must ONLY describe SAFE items (things that can be deleted).
+caution_advice must ONLY describe CAUTION items (things that need review).
+Do NOT repeat the same categories in both sections — each category belongs to exactly one risk group.
+Focus on the DISTINCTIVE characteristics of each group:
+- SAFE: what is clearly deletable and why (caches, temps, build outputs)
+- CAUTION: what requires human judgment and what to look for (versioned installs, old projects, backups)
+- Output at most 2-3 sentences per section. Be concrete and actionable."
         .to_string()
 }
 
 // ---- Parsing ----
+
+/// Parse a risk string from LLM output into our Risk enum.
+pub fn parse_risk(llm_risk: Option<&str>) -> crate::model::Risk {
+    match llm_risk.map(|s| s.trim().to_lowercase()).as_deref() {
+        Some("safe") => crate::model::Risk::Safe,
+        Some("caution") => crate::model::Risk::Caution,
+        Some("system") => crate::model::Risk::System,
+        _ => crate::model::Risk::Unknown,
+    }
+}
 
 /// Parse DirSummary from JSON.  With `format` JSON Schema constraint,
 /// the model outputs clean JSON directly.  The extraction fallback handles

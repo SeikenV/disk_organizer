@@ -27,6 +27,11 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "appdata/local/nvidia/dxcache", category: "NVIDIA shader cache", purpose: "GPU shader cache; regenerated automatically", risk: Safe },
         CatalogEntry { pattern: "appdata/local/nvidia/glcache", category: "NVIDIA shader cache", purpose: "GPU shader cache; regenerated automatically", risk: Safe },
         CatalogEntry { pattern: "appdata/local/d3dscache", category: "DirectX shader cache", purpose: "GPU shader cache; regenerated automatically", risk: Safe },
+        // --- vendor GPU / driver caches ---
+        CatalogEntry { pattern: "program files/nvidia corporation/installer2", category: "NVIDIA驱动缓存", purpose: "NVIDIA驱动安装源缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "programdata/nvidia corporation/downloader", category: "NVIDIA下载缓存", purpose: "NVIDIA驱动下载临时文件；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "programdata/intel/package cache", category: "Intel驱动缓存", purpose: "Intel驱动安装源缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "program files/realtek/audio", category: "Realtek驱动安装源", purpose: "Realtek声卡驱动缓存；驱动安装后可删除", risk: Caution },
         CatalogEntry { pattern: "node_modules", category: "Node.js modules", purpose: "Project dependencies; re-installable with npm install", risk: Caution },
         CatalogEntry { pattern: "__pycache__", category: "Python bytecode cache", purpose: "Compiled .pyc files; regenerated automatically", risk: Safe },
         // --- Windows temp / update (Safe) ---
@@ -35,6 +40,9 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "windows/softwaredistribution/download", category: "Windows Update cache", purpose: "Downloaded update files; rebuilt by Windows Update", risk: Safe },
         CatalogEntry { pattern: "windows/installer/$patchcache$", category: "Windows Installer patch cache", purpose: "MSI patch cache; removing can break repair/uninstall", risk: Caution },
         CatalogEntry { pattern: "$recycle.bin", category: "Recycle Bin", purpose: "Already-deleted files awaiting purge; empty to reclaim", risk: Caution },
+        // --- driver / OEM extraction directories ---
+        CatalogEntry { pattern: "esupport/edriver", category: "驱动安装程序", purpose: "ASUS笔记本驱动安装文件；确认系统运行正常后可删除", risk: Caution },
+        CatalogEntry { pattern: "esupport", category: "OEM支持文件", purpose: "ASUS笔记本出厂驱动/软件安装源；确认不需要后可清理", risk: Caution },
         // --- browser caches (Safe) ---
         CatalogEntry { pattern: "appdata/local/google/chrome/user data/default/cache", category: "Chrome cache", purpose: "Browser cache; rebuilt automatically", risk: Safe },
         CatalogEntry { pattern: "appdata/local/microsoft/edge/user data/default/cache", category: "Edge cache", purpose: "Browser cache; rebuilt automatically", risk: Safe },
@@ -55,6 +63,35 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "swapfile.sys", category: "Swap file", purpose: "System swap file; managed by Windows", risk: System },
         CatalogEntry { pattern: "$mft", category: "Master File Table", purpose: "NTFS metadata; do not delete", risk: System },
         CatalogEntry { pattern: "program files/windowsapps", category: "Store apps", purpose: "Installed Store apps; uninstall via Settings, not by deleting", risk: System },
+        // --- Windows maintenance paths ---
+        CatalogEntry { pattern: "windows/winsxs/manifestcache", category: "WinSxS清单缓存", purpose: "Windows组件存储清单缓存；可安全清理", risk: Safe },
+        CatalogEntry { pattern: "windows/prefetch", category: "预读取缓存", purpose: "Windows预读取文件；系统自动管理，可安全删除", risk: Safe },
+        CatalogEntry { pattern: "windows/assembly/*", category: ".NET程序集缓存", purpose: ".NET全局程序集预编译缓存；系统管理，不建议手动删除", risk: Caution },
+        CatalogEntry { pattern: "windows.old", category: "旧Windows安装", purpose: "系统升级残留；确认不需要回滚后可用磁盘清理删除", risk: Caution },
+        CatalogEntry { pattern: "$windows.~bt", category: "Windows安装临时文件", purpose: "Windows安装/升级临时文件；安装完成后可安全删除", risk: Safe },
+        CatalogEntry { pattern: "$windows.~ws", category: "Windows安装临时文件", purpose: "Windows安装/升级临时文件；安装完成后可安全删除", risk: Safe },
+        CatalogEntry { pattern: "windows/system32/winevt/logs", category: "Windows事件日志", purpose: "系统事件日志文件；可安全清除，但会丢失诊断记录", risk: Caution },
+        CatalogEntry { pattern: "windows/memory.dmp", category: "内存转储文件", purpose: "系统崩溃内存转储；如不需要调试可安全删除", risk: Safe },
+        CatalogEntry { pattern: "windows/minidump", category: "小型崩溃转储", purpose: "小型内存转储文件；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "memory.dmp", category: "内存转储文件", purpose: "系统崩溃内存转储(根目录)；如不需要调试可安全删除", risk: Safe },
+        CatalogEntry { pattern: "programdata/package cache", category: "WIX/MSI安装源", purpose: "MSI/WIX软件安装源缓存；安装后可安全删除", risk: Safe },
+        CatalogEntry { pattern: "programdata/microsoft/visualstudio/packages", category: "VS安装缓存", purpose: "Visual Studio安装源缓存；可安全删除", risk: Safe },
+        // --- application caches (Safe) ---
+        CatalogEntry { pattern: "appdata/roaming/discord/cache", category: "Discord缓存", purpose: "Discord应用缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/slack/cache", category: "Slack缓存", purpose: "Slack应用缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/code/cache", category: "VS Code缓存", purpose: "VS Code编辑器缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/zoom/data", category: "Zoom数据", purpose: "Zoom会议数据；可能含录制文件，确认后删除", risk: Caution },
+        CatalogEntry { pattern: "appdata/roaming/sun/java/deployment/cache", category: "Java缓存", purpose: "Java部署缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/vlc/art", category: "VLC缓存", purpose: "VLC播放器封面缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/microsoft/windows/recent", category: "最近文件", purpose: "Windows最近文件快捷方式列表；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/local/microsoft/windows/explorer", category: "缩略图缓存", purpose: "文件资源管理器缩略图缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/local/microsoft/media player", category: "媒体播放器缓存", purpose: "Windows Media Player缓存；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/tencent/logs", category: "腾讯日志", purpose: "腾讯软件日志文件；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/duowan/yy/log", category: "YY日志", purpose: "YY语音日志文件；可安全删除", risk: Safe },
+        CatalogEntry { pattern: "appdata/roaming/baiduyunkernel/data", category: "百度网盘缓存", purpose: "百度网盘数据缓存；可安全删除", risk: Safe },
+        // --- installed-software version artifacts ---
+        CatalogEntry { pattern: "program files/tencent/qqnt/versions", category: "QQ旧版本", purpose: "QQNT旧版本安装目录；可清理旧版本保留最新", risk: Caution },
+        CatalogEntry { pattern: "program files/tencent/wemeet", category: "腾讯会议安装", purpose: "腾讯会议安装目录；旧版本可清理但建议通过卸载程序操作", risk: Caution },
         // --- git repositories (Caution) ---
         CatalogEntry { pattern: ".git", category: "Git repository data", purpose: "Git version control database (objects, refs, history); removing loses commit history — re-clone from remote to restore", risk: Caution },
     ]

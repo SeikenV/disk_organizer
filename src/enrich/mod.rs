@@ -4,7 +4,7 @@ mod llm;
 use crate::index::Index;
 use crate::model::{Item, Source};
 use crate::report::ReportFile;
-use log::{info, warn, error};
+use log::{debug, info, warn, error};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -19,14 +19,15 @@ pub use content::analyze_directory_contents;
 pub use llm::health_check as is_ollama_running;
 pub use llm::preload_model;
 pub use llm::summarize_report;
-pub use llm::{DirSummary, FinalReport};
+pub use llm::{DirSummary, FinalReport, parse_risk};
 
 // ---- Re-export centralized constants (convenience for intra-module use) ----
 use crate::consts::{
-    CWND_INIT, CWND_MIN,
+    cwnd_init,
     MAX_RETRIES, MAX_SAFETY_CWND,
     PROBE_INTERVAL, RETRY_BASE_DELAY,
-    VEGAS_ALPHA, VEGAS_BETA,
+    TP_GROW_STEP, TP_PROBE_STEP, TP_PROBE_AFTER_STABLE,
+    TP_IMPROVING_RATIO, TP_PROBE_WIN_RATIO,
 };
 
 // ---- Configuration ----
@@ -71,6 +72,10 @@ enum WorkKind {
         samples: Vec<String>,
         /// Nearest meaningful ancestor (project-level context), e.g. "myproject (git repo)".
         ancestor_context: Option<String>,
+        /// Physical size of the directory in MB.
+        size_mb: u64,
+        /// Content summary: file count, ext distribution, subdir stats.
+        content_summary: String,
     },
     File {
         ext: String,
@@ -80,6 +85,8 @@ enum WorkKind {
         siblings: Vec<String>,
         /// Nearest meaningful ancestor (project-level context), e.g. "myproject (git repo)".
         ancestor_context: Option<String>,
+        /// Physical size of the file in MB.
+        size_mb: u64,
     },
 }
 
@@ -101,30 +108,42 @@ struct ProbeRecord {
     completed_in_window: usize,
     throughput_rps: f64,
     srtt_ms: f64,
-    /// Vegas base_rtt — current minimum observed latency (ms).
-    base_rtt_ms: f64,
     /// Effective per-task completion pacing in this window (ms).
     per_task_ms: f64,
-    /// Vegas estimated queue depth (jobs).
-    est_queue: f64,
-    /// Vegas decision: "grow", "shrink", or "steady".
-    vegas_action: String,
+    /// Best throughput observed so far (req/s).
+    best_tp_rps: f64,
+    /// Best cwnd at which best_tp was observed.
+    best_cwnd: usize,
+    /// Current phase: "growing", "plateau", or "probing".
+    phase: String,
 }
 
-// ---- Cwnd: Vegas concurrency control ----
+// ---- Cwnd: Throughput-driven concurrency control ----
 //
-// Design (TCP Vegas, adapted for LLM workload):
+// Design (throughput-maximizing, not latency-minimizing):
 //   Workers acquire/release permits via blocking Condvar (unchanged).
-//   Every successful request feeds a latency sample to the Vegas estimator
-//   which continuously tracks base_rtt (minimum observed latency) and uses
-//   estimated queue depth to decide cwnd adjustments.
+//   Every PROBE_INTERVAL, the supervisor computes window throughput and
+//   adjusts cwnd to chase the throughput peak:
+//     - Grow while throughput improves
+//     - Snap back to best cwnd when throughput drops
+//     - Periodically probe upward to discover increased capacity
 //
-//   base_rtt is NOT frozen — it tracks the running minimum of all successful
-//   latency samples, so cwnd naturally grows as the model warms up and
-//   individual request latency drops.
+//   This is fundamentally different from Vegas: individual request latency
+//   is irrelevant — only total batch wall-clock time matters.
+
+/// Throughput-probe phase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TpPhase {
+    /// Aggressively growing cwnd — throughput is still improving.
+    Growing,
+    /// Throughput plateaued; holding best cwnd, counting toward next probe.
+    Plateau,
+    /// Probing upward — increased cwnd to test for new capacity.
+    Probing,
+}
 
 struct CwndCtl {
-    /// Current concurrency window — written by Vegas update after each request.
+    /// Current concurrency window — written by supervisor each probe cycle.
     cwnd: AtomicUsize,
     /// Currently in-flight requests.
     inflight: AtomicUsize,
@@ -133,10 +152,19 @@ struct CwndCtl {
     permit_cv: Condvar,
     /// Smoothed round-trip time (ms). EWMA, for display only.
     srtt_ms: Mutex<f64>,
-    /// Vegas base_rtt — minimum observed successful latency (ms).
-    vegas_base_rtt_ms: Mutex<f64>,
     /// Requests completed since last probe snapshot (workers inc, supervisor resets).
     completed_this_window: AtomicUsize,
+    /// Throughput state — written exclusively by supervisor.
+    /// Best throughput observed so far (req/s).
+    best_tp: Mutex<f64>,
+    /// cwnd at which best_tp was observed.
+    best_cwnd: AtomicUsize,
+    /// Throughput from previous probe window.
+    prev_tp: Mutex<f64>,
+    /// Current phase.
+    phase: Mutex<TpPhase>,
+    /// Consecutive plateau windows (for triggering upward probe).
+    stable_count: AtomicUsize,
     /// Peak inflight observed (for final summary).
     peak_inflight: AtomicUsize,
     /// Peak cwnd observed (for final summary).
@@ -149,16 +177,21 @@ struct CwndCtl {
 
 impl CwndCtl {
     fn new() -> Self {
+        let init = cwnd_init();
         Self {
-            cwnd: AtomicUsize::new(CWND_INIT),
+            cwnd: AtomicUsize::new(init),
             inflight: AtomicUsize::new(0),
             permit_mutex: Mutex::new(()),
             permit_cv: Condvar::new(),
             srtt_ms: Mutex::new(0.0),
-            vegas_base_rtt_ms: Mutex::new(0.0),
             completed_this_window: AtomicUsize::new(0),
+            best_tp: Mutex::new(0.0),
+            best_cwnd: AtomicUsize::new(init),
+            prev_tp: Mutex::new(0.0),
+            phase: Mutex::new(TpPhase::Growing),
+            stable_count: AtomicUsize::new(0),
             peak_inflight: AtomicUsize::new(0),
-            peak_cwnd: AtomicUsize::new(CWND_INIT),
+            peak_cwnd: AtomicUsize::new(init),
             probe_log: Mutex::new(Vec::new()),
             start: Instant::now(),
         }
@@ -189,19 +222,20 @@ impl CwndCtl {
             let guard = self.permit_mutex.lock().unwrap();
             // Re-check before sleeping (handles spurious wakeups and races).
             if self.inflight.load(Ordering::Relaxed) < self.cwnd.load(Ordering::Relaxed) {
-                drop(guard); // explicitly drop before retry
+                drop(guard);
                 continue; // permit freed while locking — retry
             }
             drop(self.permit_cv.wait(guard).unwrap());
         }
     }
 
-    /// Report a successful completion.  Workers call this; Vegas adjusts cwnd.
+    /// Report a successful completion — lightweight, no cwnd decisions here.
+    /// cwnd is adjusted exclusively by the supervisor each probe window.
     fn release_success(&self, latency_ms: f64) {
         self.inflight.fetch_sub(1, Ordering::SeqCst);
         self.completed_this_window.fetch_add(1, Ordering::Relaxed);
 
-        // Update SRTT EWMA (for display).
+        // Update SRTT EWMA (for display only, not used for control).
         {
             let mut srtt = self.srtt_ms.lock().unwrap();
             if *srtt == 0.0 {
@@ -211,63 +245,80 @@ impl CwndCtl {
             }
         }
 
-        // Vegas congestion control — per-sample update.
-        self.vegas_update(latency_ms);
-
         self.permit_cv.notify_one();
     }
 
-    /// Vegas congestion control: estimate queue depth, adjust cwnd.
+    /// Throughput-driven cwnd update — called by supervisor each window.
     ///
-    /// Uses TCP Vegas logic adapted for LLM workloads:
-    /// - base_rtt = running minimum latency (NOT frozen — continuously updated)
-    /// - est_queue = (in_flight / latency) × (latency - base_rtt)
-    /// - Grow when est_queue < α × log₁₀(cwnd)
-    /// - Shrink when est_queue > β × log₁₀(cwnd)
-    #[allow(clippy::cast_precision_loss)]
-    fn vegas_update(&self, latency_ms: f64) {
+    /// Algorithm:
+    ///   1. Compute current_tp from completed_this_window.
+    ///   2. If current_tp > best_tp, record new best.
+    ///   3. Match on phase:
+    ///      Growing: if still improving, keep growing; if dropped, snap to best.
+    ///      Plateau:  count stable windows, then trigger upward probe.
+    ///      Probing:  if probe improved throughput, go back to Growing;
+    ///                if no improvement, fall back to best and go to Plateau.
+    fn update_cwnd(&self, completed: usize) {
+        let current_tp = completed as f64 / PROBE_INTERVAL.as_secs_f64();
         let cwnd = self.cwnd.load(Ordering::Relaxed);
-        let inflight = self.inflight.load(Ordering::Relaxed).max(1); // snapshot after release
 
-        let mut base = self.vegas_base_rtt_ms.lock().unwrap();
-
-        // Track minimum observed latency — this is the key fix: base_rtt is
-        // continuously updated, so cwnd can grow as the model warms up.
-        if *base == 0.0 {
-            *base = latency_ms;
-            return; // first sample, no decision yet
-        }
-        if latency_ms < *base {
-            *base = latency_ms;
-            // New lower baseline — potentially room to grow.
-            // Fall through to normal evaluation.
+        // Update best if improved.
+        {
+            let mut best = self.best_tp.lock().unwrap();
+            if current_tp > *best {
+                *best = current_tp;
+                self.best_cwnd.store(cwnd, Ordering::Relaxed);
+            }
         }
 
-        let extra_latency = latency_ms - *base;
-        if extra_latency <= 0.0 {
-            return; // at or below baseline, no congestion signal
-        }
+        let best_tp_val = *self.best_tp.lock().unwrap();
+        let prev_tp_val = *self.prev_tp.lock().unwrap();
+        let mut phase = *self.phase.lock().unwrap();
 
-        // throughput = inflight / latency (jobs per ms)
-        // est_queue = throughput × extra_latency  (estimated queued jobs)
-        let throughput = inflight as f64 / latency_ms.max(0.001);
-        let est_queue = throughput * extra_latency;
-
-        // Thresholds scale with log₁₀(cwnd) — more slack at higher cwnd.
-        let log_cwnd = (cwnd as f64).log10().max(1.0);
-        let alpha = VEGAS_ALPHA * log_cwnd;
-        let beta = VEGAS_BETA * log_cwnd;
-
-        let new_cwnd = if est_queue > beta {
-            // Congestion: too many queued jobs.
-            cwnd.saturating_sub(1).max(CWND_MIN)
-        } else if est_queue < alpha {
-            // Headroom: room to increase concurrency.
-            (cwnd + 1).min(MAX_SAFETY_CWND)
-        } else {
-            // Sweet spot: alpha..=beta band, no change.
-            cwnd
+        let new_cwnd = match phase {
+            TpPhase::Growing => {
+                if prev_tp_val > 0.0 && current_tp < prev_tp_val * TP_IMPROVING_RATIO {
+                    // Throughput dropped — snap to best and go to plateau.
+                    phase = TpPhase::Plateau;
+                    self.stable_count.store(0, Ordering::Relaxed);
+                    self.best_cwnd.load(Ordering::Relaxed)
+                } else {
+                    // Still improving — keep growing.
+                    (cwnd + TP_GROW_STEP).min(MAX_SAFETY_CWND)
+                }
+            }
+            TpPhase::Plateau => {
+                let sc = self.stable_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if sc >= TP_PROBE_AFTER_STABLE as usize {
+                    // Time to probe upward.
+                    phase = TpPhase::Probing;
+                    self.stable_count.store(0, Ordering::Relaxed);
+                    (cwnd + TP_PROBE_STEP).min(MAX_SAFETY_CWND)
+                } else {
+                    // Stay put.
+                    cwnd
+                }
+            }
+            TpPhase::Probing => {
+                if current_tp > best_tp_val * TP_PROBE_WIN_RATIO {
+                    // Probe found more capacity! Start growing again.
+                    phase = TpPhase::Growing;
+                    (cwnd + TP_GROW_STEP).min(MAX_SAFETY_CWND)
+                } else if current_tp < prev_tp_val * TP_IMPROVING_RATIO {
+                    // Probe hurt — fall back to best.
+                    phase = TpPhase::Plateau;
+                    self.stable_count.store(0, Ordering::Relaxed);
+                    self.best_cwnd.load(Ordering::Relaxed)
+                } else {
+                    // No clear signal — continue probing deeper.
+                    cwnd
+                }
+            }
         };
+
+        // Store updated state.
+        *self.phase.lock().unwrap() = phase;
+        *self.prev_tp.lock().unwrap() = current_tp;
 
         if new_cwnd != cwnd {
             self.cwnd.store(new_cwnd, Ordering::Relaxed);
@@ -295,7 +346,6 @@ impl CwndCtl {
         self.inflight.fetch_sub(1, Ordering::SeqCst);
         self.completed_this_window.fetch_add(1, Ordering::Relaxed);
         self.permit_cv.notify_one();
-        // Don't update SRTT on failure — the error isn't a latency sample.
     }
 
     /// Release a permit temporarily (for retry backoff) WITHOUT counting
@@ -309,10 +359,6 @@ impl CwndCtl {
         *self.srtt_ms.lock().unwrap()
     }
 
-    fn base_rtt(&self) -> f64 {
-        *self.vegas_base_rtt_ms.lock().unwrap()
-    }
-
     /// Wake all workers blocked on `acquire()`.  Used by the supervisor
     /// after cwnd is increased, and by tests.
     #[allow(dead_code)]
@@ -321,23 +367,22 @@ impl CwndCtl {
     }
 }
 
-// ---- Supervisor: periodic progress print + probe log ----
+// ---- Supervisor: periodic throughput probe + progress display ----
 
 /// Runs the supervisor for one or two backends.
 ///
-/// Every PROBE_INTERVAL the supervisor snapshots cwnd/inflight/srtt/base_rtt
-/// and appends a record to the probe log.  It does NOT make any congestion
-/// control decisions — Vegas handles that per-sample in `release_success()`.
+/// Every PROBE_INTERVAL the supervisor:
+///   1. Calls `update_cwnd()` — throughput-driven cwnd adjustment.
+///   2. Snapshots state and appends a probe record.
+///   3. Prints progress to stderr.
 ///
-/// The supervisor also prints periodic progress to stderr.
+/// cwnd decisions are made HERE (periodic), not in release_success().
 fn run_supervisor(
     gpu_ctl: &Arc<CwndCtl>,
     igpu_ctl: Option<&Arc<CwndCtl>>,
     total: usize,
     done: &Arc<AtomicUsize>,
 ) {
-    let mut last_completed: usize = 0;
-
     loop {
         thread::sleep(PROBE_INTERVAL);
         let d = done.load(Ordering::Relaxed);
@@ -345,40 +390,38 @@ fn run_supervisor(
             break;
         }
 
-        append_probe_log(gpu_ctl, total, &mut last_completed);
+        // ---- Throughput-driven cwnd update (THE control decision) ----
+        let gpu_completed = gpu_ctl.completed_this_window.swap(0, Ordering::Relaxed);
+        gpu_ctl.update_cwnd(gpu_completed);
+        append_probe_log(gpu_ctl, gpu_completed);
 
         let gpu_cwnd = gpu_ctl.cwnd.load(Ordering::Relaxed);
         let gpu_inf = gpu_ctl.inflight.load(Ordering::Relaxed);
         let gpu_srtt = gpu_ctl.srtt();
-        let gpu_base = gpu_ctl.base_rtt();
 
         if let Some(ictl) = igpu_ctl {
-            append_probe_log(ictl, total, &mut last_completed);
+            let icompleted = ictl.completed_this_window.swap(0, Ordering::Relaxed);
+            ictl.update_cwnd(icompleted);
+            append_probe_log(ictl, icompleted);
             let icwnd = ictl.cwnd.load(Ordering::Relaxed);
             let iinf = ictl.inflight.load(Ordering::Relaxed);
             let isrtt = ictl.srtt();
-            let ibase = ictl.base_rtt();
             eprint!(
-                "\r  [{d}/{total}] dGPU cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms base={gpu_base:.0}ms | iGPU cwnd={icwnd} infl={iinf} srtt={isrtt:.0}ms base={ibase:.0}ms  ",
+                "\r  [{d}/{total}] dGPU cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms | iGPU cwnd={icwnd} infl={iinf} srtt={isrtt:.0}ms  ",
             );
         } else {
             eprint!(
-                "\r  [{d}/{total}] cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms base={gpu_base:.0}ms  ",
+                "\r  [{d}/{total}] cwnd={gpu_cwnd} infl={gpu_inf} srtt={gpu_srtt:.0}ms  ",
             );
         }
     }
 }
 
 /// Snapshot the current state into the probe log for one backend.
-fn append_probe_log(ctl: &CwndCtl, total: usize, last_completed: &mut usize) {
-    let completed_now = ctl.completed_this_window.load(Ordering::Relaxed);
-    let completed_in_window = completed_now.saturating_sub(*last_completed);
-    *last_completed = completed_now;
-
+fn append_probe_log(ctl: &CwndCtl, completed_in_window: usize) {
     let current_cwnd = ctl.cwnd.load(Ordering::Relaxed);
     let snapshot_inflight = ctl.inflight.load(Ordering::Relaxed);
     let srtt = ctl.srtt();
-    let base_rtt = ctl.base_rtt();
     let window_throughput =
         completed_in_window as f64 / PROBE_INTERVAL.as_secs_f64();
     let per_task_ms = if completed_in_window > 0 {
@@ -387,32 +430,9 @@ fn append_probe_log(ctl: &CwndCtl, total: usize, last_completed: &mut usize) {
         0.0
     };
 
-    // Compute Vegas est_queue for the log (approximate, using last known values).
-    let est_queue = if base_rtt > 0.0 && srtt > base_rtt {
-        let inf = snapshot_inflight.max(1) as f64;
-        let throughput = inf / srtt.max(0.001);
-        throughput * (srtt - base_rtt)
-    } else {
-        0.0
-    };
-
-    let log_cwnd = (current_cwnd as f64).log10().max(1.0);
-    let alpha = VEGAS_ALPHA * log_cwnd;
-    let beta = VEGAS_BETA * log_cwnd;
-    let action = if est_queue > beta {
-        "shrink"
-    } else if est_queue < alpha {
-        "grow"
-    } else {
-        "steady"
-    };
-
-    let max_cwnd = total.min(MAX_SAFETY_CWND);
-    let vegas_action = if current_cwnd >= max_cwnd {
-        "capped"
-    } else {
-        action
-    };
+    let best_tp = *ctl.best_tp.lock().unwrap();
+    let best_cwnd = ctl.best_cwnd.load(Ordering::Relaxed);
+    let phase = format!("{:?}", *ctl.phase.lock().unwrap());
 
     ctl.probe_log.lock().unwrap().push(ProbeRecord {
         elapsed_ms: ctl.start.elapsed().as_millis() as u64,
@@ -421,10 +441,10 @@ fn append_probe_log(ctl: &CwndCtl, total: usize, last_completed: &mut usize) {
         completed_in_window,
         throughput_rps: window_throughput,
         srtt_ms: srtt,
-        base_rtt_ms: base_rtt,
         per_task_ms,
-        est_queue,
-        vegas_action: vegas_action.into(),
+        best_tp_rps: best_tp,
+        best_cwnd,
+        phase,
     });
 }
 
@@ -472,7 +492,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
 
     info!(
         "[LLM] Enriching {} item(s) ({} dirs, {} files) via {} (dGPU={} threads, iGPU={} threads, cwnd_init={}) ...",
-        total, dir_count, file_count, config.model, gpu_threads, igpu_threads, CWND_INIT,
+        total, dir_count, file_count, config.model, gpu_threads, igpu_threads, cwnd_init(),
     );
 
     let start_time = Instant::now();
@@ -651,7 +671,12 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     for (idx, ref summary) in &results {
         items[*idx].category = summary.category.clone();
         items[*idx].purpose = summary.purpose.clone();
-        items[*idx].source = Source::Rule;
+        let llm_risk = llm::parse_risk(summary.risk.as_deref());
+        // Only override risk if it was Unknown — don't downgrade catalog risks.
+        if items[*idx].risk == crate::model::Risk::Unknown {
+            items[*idx].risk = llm_risk;
+        }
+        items[*idx].source = Source::LLM;
     }
 
     let ok = results.len();
@@ -716,40 +741,40 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     {
         let log = gpu_cwnd_ctl.probe_log.lock().unwrap();
         if !log.is_empty() {
-            // --- stderr: compact table ---
-            info!("");
-            info!("{}", "=".repeat(80));
-            info!("  PROBE LOG (Vegas congestion control)");
-            info!("{}", "=".repeat(80));
-            info!(
-                "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7}",
-                "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "base", "t/ms", "queue", "action"
+            // --- file: compact table (debug level → log file only, not terminal) ---
+            debug!("");
+            debug!("{}", "=".repeat(80));
+            debug!("  PROBE LOG (throughput-driven cwnd)");
+            debug!("{}", "=".repeat(80));
+            debug!(
+                "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>8} {:>5} {:>7}",
+                "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "t/ms", "best_tp", "b_cw", "phase"
             );
-            info!("  {}", "-".repeat(76));
+            debug!("  {}", "-".repeat(76));
             for r in log.iter() {
-                info!(
-                    "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>6.0} {:>7.0} {:>7.1} {:>7}",
+                debug!(
+                    "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>7.0} {:>7.1} {:>5} {:>7}",
                     r.elapsed_ms, r.cwnd, r.inflight, r.completed_in_window,
-                    r.throughput_rps, r.srtt_ms, r.base_rtt_ms, r.per_task_ms,
-                    r.est_queue, r.vegas_action,
+                    r.throughput_rps, r.srtt_ms, r.per_task_ms,
+                    r.best_tp_rps, r.best_cwnd, r.phase,
                 );
             }
-            info!("{}", "=".repeat(80));
+            debug!("{}", "=".repeat(80));
 
             // --- Disk: detailed table ---
             if let Some(ref mut rep) = report {
-                let _ = rep.section("PROBE LOG (Vegas congestion control)");
+                let _ = rep.section("PROBE LOG (throughput-driven cwnd)");
                 let _ = rep.line(&format!(
-                    "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7}",
-                    "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "base", "t/ms", "queue", "action"
+                    "  {:>7} {:>5} {:>5} {:>7} {:>8} {:>7} {:>7} {:>8} {:>5} {:>7}",
+                    "elapsed", "cwnd", "infl", "done/w", "rps", "srtt", "t/ms", "best_tp", "b_cw", "phase"
                 ));
                 let _ = rep.line(&format!("  {}", "-".repeat(76)));
                 for r in log.iter() {
                     let _ = rep.line(&format!(
-                        "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>6.0} {:>7.0} {:>7.1} {:>7}",
+                        "  {:>6}ms {:>4} {:>4} {:>6} {:>7.1} {:>6.0} {:>7.0} {:>7.1} {:>5} {:>7}",
                         r.elapsed_ms, r.cwnd, r.inflight, r.completed_in_window,
-                        r.throughput_rps, r.srtt_ms, r.base_rtt_ms, r.per_task_ms,
-                        r.est_queue, r.vegas_action,
+                        r.throughput_rps, r.srtt_ms, r.per_task_ms,
+                        r.best_tp_rps, r.best_cwnd, r.phase,
                     ));
                 }
 
@@ -807,7 +832,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
 
     // ---- Final LLM summary report ----
     // Collect top-N per risk group by size (avoid huge prompts that cause 400).
-    const REPORT_TOP_PER_GROUP: usize = 15;
+    const REPORT_TOP_PER_GROUP: usize = 10;
 
     fn top_by_size(items: &[Item], risk: crate::model::Risk, n: usize) -> (Vec<DirSummary>, f64) {
         let mut matching: Vec<&Item> = items.iter().filter(|it| it.risk == risk).collect();
@@ -819,6 +844,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
             .map(|it| DirSummary {
                 category: it.category.clone(),
                 purpose: it.purpose.clone(),
+                risk: None,
             })
             .collect();
         (summaries, mb)
@@ -847,7 +873,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
             let _ = rep.line("[LLM] Ollama not responding, skipping final report.");
         }
     } else {
-        for attempt in 1..=2 {
+        for attempt in 1..=3 {
             if attempt > 1 {
                 warn!("[LLM] Retrying final report (attempt {attempt})...");
             } else {
@@ -870,6 +896,9 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                 system_total,
                 unknown_total,
             );
+            if let Err(ref e) = report_result {
+                warn!("[LLM] Final report attempt {attempt} failed: {e}");
+            }
             if report_result.is_ok() {
                 break;
             }
@@ -931,12 +960,15 @@ fn collect_work(items: &[Item], index: &Index, sample_count: usize) -> Vec<WorkI
             // Only Unknown dirs (catalog-matched dirs are already classified).
             if it.source == Source::Unknown {
                 let ancestor_context = find_ancestor_context(it.frn, index);
+                let content_summary = content::summarize_children(it.frn, index);
                 work.push(WorkItem {
                     idx: i,
                     path: it.path.clone(),
                     kind: WorkKind::Dir {
                         samples: sample_children(it.frn, index, sample_count),
                         ancestor_context,
+                        size_mb: it.physical_size / (1024 * 1024),
+                        content_summary,
                     },
                 });
             }
@@ -959,6 +991,7 @@ fn collect_work(items: &[Item], index: &Index, sample_count: usize) -> Vec<WorkI
                         parent_dir,
                         siblings,
                         ancestor_context,
+                        size_mb: it.physical_size / (1024 * 1024),
                     },
                 });
             }
@@ -1119,15 +1152,16 @@ fn sample_children(frn: u64, index: &Index, max: usize) -> Vec<String> {
 fn do_summarize(endpoint: &str, model: &str, wi: &WorkItem) -> Result<DirSummary, String> {
     let path_str = wi.path.to_string_lossy();
     match &wi.kind {
-        WorkKind::Dir { samples, ancestor_context } => {
-            llm::summarize_dir(endpoint, model, &path_str, samples, ancestor_context.as_deref())
+        WorkKind::Dir { samples, ancestor_context, size_mb, content_summary } => {
+            llm::summarize_dir(endpoint, model, &path_str, samples, ancestor_context.as_deref(), *size_mb, content_summary)
         }
         WorkKind::File {
             ext,
             parent_dir,
             siblings,
             ancestor_context,
-        } => llm::summarize_file(endpoint, model, &path_str, parent_dir, siblings, ext, ancestor_context.as_deref()),
+            size_mb,
+        } => llm::summarize_file(endpoint, model, &path_str, parent_dir, siblings, ext, ancestor_context.as_deref(), *size_mb),
     }
 }
 
@@ -1143,6 +1177,7 @@ pub fn setup_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::CWND_MIN;
     use crate::index::build_index;
     use crate::model::{RawRecord, Risk};
 
@@ -1175,18 +1210,21 @@ mod tests {
     }
 
     // ===================================================================
-    //  CwndCtl — init (Vegas)
+    //  CwndCtl — init
     // ===================================================================
 
     #[test]
     fn cwndctl_init_defaults() {
         let ctl = CwndCtl::new();
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT);
+        let init = cwnd_init();
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), init);
         assert_eq!(ctl.inflight.load(Ordering::Relaxed), 0);
         assert_eq!(ctl.srtt(), 0.0);
-        assert_eq!(ctl.base_rtt(), 0.0);
         assert_eq!(ctl.peak_inflight.load(Ordering::Relaxed), 0);
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), CWND_INIT);
+        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), init);
+        assert_eq!(*ctl.best_tp.lock().unwrap(), 0.0);
+        assert_eq!(ctl.best_cwnd.load(Ordering::Relaxed), init);
+        assert_eq!(*ctl.phase.lock().unwrap(), TpPhase::Growing);
         assert!(ctl.probe_log.lock().unwrap().is_empty());
     }
 
@@ -1222,13 +1260,14 @@ mod tests {
     #[test]
     fn cwndctl_acquires_up_to_cwnd_before_blocking() {
         let ctl = CwndCtl::new();
-        for _ in 0..CWND_INIT {
+        let init = cwnd_init();
+        for _ in 0..init {
             ctl.acquire();
         }
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), init);
         ctl.release_success(50.0);
         ctl.acquire();
-        assert_eq!(ctl.inflight.load(Ordering::Relaxed), CWND_INIT);
+        assert_eq!(ctl.inflight.load(Ordering::Relaxed), init);
     }
 
     #[test]
@@ -1325,138 +1364,116 @@ mod tests {
     }
 
     // ===================================================================
-    //  Vegas congestion control — base_rtt tracking
+    //  Throughput-driven cwnd control — update_cwnd
     // ===================================================================
 
     #[test]
-    fn vegas_base_rtt_tracks_minimum() {
+    fn tp_cycle_grows_while_improving() {
+        // Simulate 3 windows where throughput keeps improving.
+        // cwnd should grow each time.
         let ctl = CwndCtl::new();
-        ctl.acquire();
-        ctl.release_success(2000.0);
-        assert!((ctl.base_rtt() - 2000.0).abs() < 0.01);
+        let init = cwnd_init();
+        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), init);
 
-        ctl.acquire();
-        ctl.release_success(1500.0);
-        assert!((ctl.base_rtt() - 1500.0).abs() < 0.01); // dropped
+        // Window 1: 2 completions → tp=4
+        ctl.update_cwnd(2);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) > init,
+            "cwnd should grow on improving throughput, got {}", ctl.cwnd.load(Ordering::Relaxed));
 
-        ctl.acquire();
-        ctl.release_success(1800.0);
-        assert!((ctl.base_rtt() - 1500.0).abs() < 0.01); // no change, 1800 > 1500
+        let cwnd2 = ctl.cwnd.load(Ordering::Relaxed);
+        // Window 2: 4 completions → tp=8 (higher than 4)
+        ctl.update_cwnd(4);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) > cwnd2,
+            "cwnd should grow again, got {}", ctl.cwnd.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn vegas_zero_base_rtt_no_decision() {
-        // First sample just sets base_rtt, doesn't change cwnd.
+    fn tp_snaps_to_best_when_throughput_drops() {
+        // Simulate: grow to high cwnd, then throughput drops → snap to best.
         let ctl = CwndCtl::new();
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT);
-        ctl.acquire();
-        ctl.release_success(1000.0);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), CWND_INIT); // cwnd unchanged
-        assert!((ctl.base_rtt() - 1000.0).abs() < 0.01);
+        // Build up best: 4 completions → tp=8
+        ctl.update_cwnd(4);
+        let best_cwnd = ctl.best_cwnd.load(Ordering::Relaxed);
+        assert!(best_cwnd > 0);
+
+        // Next window: keep growing
+        ctl.update_cwnd(8);
+        let high_cwnd = ctl.cwnd.load(Ordering::Relaxed);
+
+        // Now throughput drops sharply: 1 completion → tp=2 (way below 16)
+        ctl.update_cwnd(1);
+        // Should snap back to best_cwnd.
+        assert!(ctl.cwnd.load(Ordering::Relaxed) <= best_cwnd + TP_GROW_STEP,
+            "should snap near best, got {} vs best {}", ctl.cwnd.load(Ordering::Relaxed), best_cwnd);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) < high_cwnd,
+            "should be below peak cwnd after throughput drop");
+        assert_eq!(*ctl.phase.lock().unwrap(), TpPhase::Plateau);
     }
 
     #[test]
-    fn vegas_update_drops_base_rtt_then_grows_cwnd() {
-        // base_rtt starts at 2000ms (cold), then drops to ~1000ms (warm).
-        // cwnd should grow once samples are above the new lower baseline.
+    fn tp_probes_upward_after_stable() {
+        // Simulate: plateau for TP_PROBE_AFTER_STABLE windows, then should probe.
         let ctl = CwndCtl::new();
-        ctl.cwnd.store(4, Ordering::Relaxed);
+        // First grow then drop to plateau.
+        ctl.update_cwnd(10);
+        ctl.update_cwnd(2); // drop → plateau
+        let plateau_cwnd = ctl.cwnd.load(Ordering::Relaxed);
 
-        // First: establish high baseline (cold start).
-        ctl.acquire();
-        ctl.release_success(2000.0);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 4); // first sample, no decision
-        assert!((ctl.base_rtt() - 2000.0).abs() < 0.01);
-
-        // Second: latency drops below baseline → base_rtt drops to new minimum.
-        ctl.acquire();
-        ctl.release_success(1010.0);
-        assert!((ctl.base_rtt() - 1010.0).abs() < 0.01); // base dropped
-        // cwnd may not change because extra_latency ≈ 0 on the drop sample.
-
-        // Third: latency slightly above new baseline → est_queue tiny → grow.
-        ctl.acquire();
-        ctl.release_success(1020.0);
-        assert!(ctl.cwnd.load(Ordering::Relaxed) > 4,
-            "cwnd should grow on 3rd sample, got {}", ctl.cwnd.load(Ordering::Relaxed));
-    }
-
-    // ===================================================================
-    //  Vegas congestion control — queue estimation
-    // ===================================================================
-
-    /// Helper: create a CwndCtl pre-seeded with base_rtt and SRTT.
-    fn ctl_with_vegas_state(base_rtt: f64, cwnd_val: usize, srtt_val: f64) -> CwndCtl {
-        let ctl = CwndCtl::new();
-        *ctl.vegas_base_rtt_ms.lock().unwrap() = base_rtt;
-        ctl.cwnd.store(cwnd_val, Ordering::Relaxed);
-        if srtt_val > 0.0 {
-            *ctl.srtt_ms.lock().unwrap() = srtt_val;
+        // Stay stable for enough windows.
+        for _ in 0..TP_PROBE_AFTER_STABLE as usize {
+            ctl.update_cwnd(2); // same tp each time
         }
-        ctl
+
+        // Now it should be probing upward.
+        assert_eq!(*ctl.phase.lock().unwrap(), TpPhase::Probing);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) > plateau_cwnd,
+            "should probe above plateau, got {} vs {}", ctl.cwnd.load(Ordering::Relaxed), plateau_cwnd);
     }
 
     #[test]
-    fn vegas_grows_when_queue_is_low() {
-        // base=500, latency=510 (near baseline) → est_queue ≈ 0 → grow.
-        let ctl = ctl_with_vegas_state(500.0, 4, 510.0);
-        ctl.inflight.store(4, Ordering::Relaxed); // simulate inflight
-        ctl.vegas_update(510.0);
-        assert!(ctl.cwnd.load(Ordering::Relaxed) > 4, "expected cwnd to grow, got {}", ctl.cwnd.load(Ordering::Relaxed));
+    fn tp_update_tracks_best() {
+        let ctl = CwndCtl::new();
+        ctl.update_cwnd(5); // tp=10
+        assert!(*ctl.best_tp.lock().unwrap() > 0.0);
+        let best1 = *ctl.best_tp.lock().unwrap();
+
+        ctl.update_cwnd(10); // tp=20 → new best
+        let best2 = *ctl.best_tp.lock().unwrap();
+        assert!(best2 > best1);
+
+        ctl.update_cwnd(2); // tp=4 → no new best
+        let best3 = *ctl.best_tp.lock().unwrap();
+        assert!((best3 - best2).abs() < 0.01);
     }
 
     #[test]
-    fn vegas_shrinks_when_queue_is_high() {
-        // base=500, latency=2200 → est_queue > beta=6 → shrink.
-        // inflight=8, throughput=8/2200≈0.00364, extra=1700, est_queue≈6.18
-        let ctl = ctl_with_vegas_state(500.0, 8, 2200.0);
-        ctl.inflight.store(8, Ordering::Relaxed);
-        ctl.vegas_update(2200.0);
-        assert!(ctl.cwnd.load(Ordering::Relaxed) < 8,
-            "expected cwnd to shrink, got {}", ctl.cwnd.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn vegas_steady_when_queue_in_band() {
-        // cwnd=4 (log10(clamped to 1), alpha=3, beta=6), base=500, latency=2000.
-        // inflight=4, throughput=4/2000=0.002, extra=1500, est_queue=0.002*1500=3.0.
-        // est_queue=3.0 == alpha → not < alpha → not grow.
-        // est_queue=3.0 < beta=6 → not > beta → not shrink. → STEADY.
-        let ctl = ctl_with_vegas_state(500.0, 4, 2000.0);
-        ctl.inflight.store(4, Ordering::Relaxed);
-        ctl.vegas_update(2000.0);
-        assert_eq!(ctl.cwnd.load(Ordering::Relaxed), 4,
-            "expected steady cwnd=4, got {}", ctl.cwnd.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn vegas_respects_cwnd_min() {
-        let ctl = ctl_with_vegas_state(500.0, CWND_MIN, 2000.0);
-        ctl.inflight.store(CWND_MIN, Ordering::Relaxed);
-        ctl.vegas_update(2000.0);
+    fn tp_update_respects_cwnd_min() {
+        // Set cwnd to min-1 and ensure it stays >= CWND_MIN after update.
+        let ctl = CwndCtl::new();
+        ctl.cwnd.store(CWND_MIN, Ordering::Relaxed);
+        ctl.update_cwnd(1); // any value
         assert!(ctl.cwnd.load(Ordering::Relaxed) >= CWND_MIN);
     }
 
     #[test]
-    fn vegas_respects_cwnd_max() {
-        // cwnd must never exceed MAX_SAFETY_CWND.
-        // Start just below max — if it grows, it caps at MAX_SAFETY_CWND.
+    fn tp_update_respects_max_safety_cwnd() {
+        // Start near max, grow — should cap.
         let near_max = MAX_SAFETY_CWND - 1;
-        let ctl = ctl_with_vegas_state(500.0, near_max, 510.0);
-        ctl.inflight.store(near_max, Ordering::Relaxed);
-        ctl.vegas_update(510.0);
-        assert!(ctl.cwnd.load(Ordering::Relaxed) <= MAX_SAFETY_CWND,
-            "cwnd must not exceed MAX_SAFETY_CWND");
+        let ctl = CwndCtl::new();
+        ctl.cwnd.store(near_max, Ordering::Relaxed);
+        // Force growing phase with good throughput.
+        *ctl.phase.lock().unwrap() = TpPhase::Growing;
+        ctl.update_cwnd(100);
+        assert!(ctl.cwnd.load(Ordering::Relaxed) <= MAX_SAFETY_CWND);
     }
 
     #[test]
-    fn vegas_tracks_peak_cwnd() {
-        let ctl = ctl_with_vegas_state(500.0, 4, 500.0);
-        assert_eq!(ctl.peak_cwnd.load(Ordering::Relaxed), CWND_INIT);
-        ctl.inflight.store(4, Ordering::Relaxed);
-        ctl.vegas_update(510.0);
+    fn tp_update_tracks_peak_cwnd() {
+        let ctl = CwndCtl::new();
+        ctl.update_cwnd(10);
         let peak = ctl.peak_cwnd.load(Ordering::Relaxed);
-        assert!(peak >= ctl.cwnd.load(Ordering::Relaxed));
+        let cwnd = ctl.cwnd.load(Ordering::Relaxed);
+        assert!(peak >= cwnd);
     }
 
     // ===================================================================
@@ -1742,12 +1759,15 @@ mod tests {
 
     #[test]
     fn constants_are_sane() {
-        assert!(CWND_INIT >= CWND_MIN);
+        let cwnd = cwnd_init();
+        assert!(cwnd >= CWND_MIN);
         assert!(CWND_MIN >= 2);
-        assert!(MAX_SAFETY_CWND > CWND_INIT);
+        assert!(MAX_SAFETY_CWND > cwnd);
         assert!(MAX_SAFETY_CWND <= 65536);
-        assert!(VEGAS_ALPHA > 0.0);
-        assert!(VEGAS_BETA > VEGAS_ALPHA);
+        assert!(TP_GROW_STEP > 0);
+        assert!(TP_PROBE_STEP > TP_GROW_STEP);
+        assert!(TP_IMPROVING_RATIO > 0.0 && TP_IMPROVING_RATIO < 1.0);
+        assert!(TP_PROBE_WIN_RATIO > 1.0);
         assert!(MAX_RETRIES <= 5);
         assert_eq!(RETRY_BASE_DELAY, Duration::from_millis(200));
         assert!(PROBE_INTERVAL >= Duration::from_millis(100));
@@ -1766,10 +1786,10 @@ mod tests {
             completed_in_window: 8,
             throughput_rps: 16.0,
             srtt_ms: 2500.0,
-            base_rtt_ms: 1000.0,
             per_task_ms: 62.5,
-            est_queue: 2.5,
-            vegas_action: "grow".into(),
+            best_tp_rps: 18.0,
+            best_cwnd: 24,
+            phase: "growing".into(),
         };
         assert_eq!(r.elapsed_ms, 500);
         assert_eq!(r.cwnd, 16);
@@ -1777,9 +1797,9 @@ mod tests {
         assert_eq!(r.completed_in_window, 8);
         assert!((r.throughput_rps - 16.0).abs() < 0.01);
         assert!((r.srtt_ms - 2500.0).abs() < 0.01);
-        assert!((r.base_rtt_ms - 1000.0).abs() < 0.01);
         assert!((r.per_task_ms - 62.5).abs() < 0.01);
-        assert!((r.est_queue - 2.5).abs() < 0.01);
-        assert_eq!(r.vegas_action, "grow");
+        assert!((r.best_tp_rps - 18.0).abs() < 0.01);
+        assert_eq!(r.best_cwnd, 24);
+        assert_eq!(r.phase, "growing");
     }
 }
