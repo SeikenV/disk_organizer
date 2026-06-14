@@ -8,7 +8,7 @@
 
 ## 关键架构决策
 - 双 GPU 后端支持（dGPU Ollama + 可选 iGPU llama-server）
-- TCP 风格的拥塞控制（SRTT-based Cwnd 自适应）
+- 吞吐量驱动的拥塞控制（cwnd 由 supervisor 每 500ms 根据窗口吞吐量调整，非 Vegas 延迟导向）
 - Selective Repeat 重传机制
 - `think: false` 禁用推理阶段（Qwen3 模型会烧 token）
 - 分类任务用结构化输出（`FormatType::StructuredJson`）
