@@ -63,6 +63,12 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "swapfile.sys", category: "Swap file", purpose: "System swap file; managed by Windows", risk: System },
         CatalogEntry { pattern: "$mft", category: "Master File Table", purpose: "NTFS metadata; do not delete", risk: System },
         CatalogEntry { pattern: "program files/windowsapps", category: "Store apps", purpose: "Installed Store apps; uninstall via Settings, not by deleting", risk: System },
+        // --- runtimes / shared frameworks (System: apps depend on these) ---
+        CatalogEntry { pattern: "program files/dotnet", category: ".NET运行时/SDK", purpose: ".NET共享运行时与SDK；已安装应用依赖它运行，不要删除", risk: System },
+        CatalogEntry { pattern: "program files (x86)/dotnet", category: ".NET运行时/SDK", purpose: ".NET共享运行时与SDK；已安装应用依赖它运行，不要删除", risk: System },
+        CatalogEntry { pattern: "program files/common files", category: "共享安装组件", purpose: "各软件共享的安装组件；删除会破坏已安装软件", risk: System },
+        CatalogEntry { pattern: "program files (x86)/common files", category: "共享安装组件", purpose: "各软件共享的安装组件；删除会破坏已安装软件", risk: System },
+        CatalogEntry { pattern: "windows/microsoft.net", category: ".NET Framework", purpose: "Windows .NET Framework运行时；系统与应用依赖，不要删除", risk: System },
         // --- Windows maintenance paths ---
         CatalogEntry { pattern: "windows/winsxs/manifestcache", category: "WinSxS清单缓存", purpose: "Windows组件存储清单缓存；可安全清理", risk: Safe },
         CatalogEntry { pattern: "windows/prefetch", category: "预读取缓存", purpose: "Windows预读取文件；系统自动管理，可安全删除", risk: Safe },
@@ -163,6 +169,14 @@ mod tests {
         assert_eq!(match_path(Path::new(r"\$MFT")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\System Volume Information")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\Windows\Installer")).unwrap().risk, Risk::Caution);
+    }
+
+    #[test]
+    fn runtime_dirs_are_system() {
+        // .NET runtime + shared component dirs must never be classified Safe.
+        assert_eq!(match_path(Path::new(r"\Program Files\dotnet")).unwrap().risk, Risk::System);
+        assert_eq!(match_path(Path::new(r"\Program Files\Common Files")).unwrap().risk, Risk::System);
+        assert_eq!(match_path(Path::new(r"\Windows\Microsoft.NET")).unwrap().risk, Risk::System);
     }
 
     #[test]

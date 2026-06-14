@@ -348,6 +348,13 @@ IMPORTANT: Do NOT assume every CAUTION item is "game data" or "Steam". Consider
 the full variety of reasons a directory may require review: drivers, professional
 software, old projects, hardware utilities, SDK toolchains, installers.
 
+关键反模式（最常被搞错）：不要因为"不认识这个厂商"就把目录当成缓存/可安全删除(safe)。
+位于 Program Files\<厂商>\ 或 Program Files (x86)\<厂商>\ 之下、且目录名本身不是
+cache/temp/log/crashpad 的目录，都是【已安装的软件】，绝不能标 safe：
+- 运行时/框架/驱动核心 (.NET、dotnet、Microsoft Shared、VC++ Redist、打印机/扫描仪驱动) → system
+- 可选厂商工具/外设软件 (ASUS Armoury、MSI Center、Razer Synapse、奔图Pantum 打印/扫描软件) → caution
+只有当目录名明确含 cache/temp/log，或路径位于已知缓存位置时，才考虑 safe。
+
 ## Risk guidelines
 
 ### SAFE to delete
@@ -415,7 +422,19 @@ Path: D:\OldProjects\abandoned_web_demo_2022\
 → {"category": "废弃项目", "purpose": "旧项目目录，确认不再需要后可删除备份后清理", "risk": "caution"}
 
 Path: C:\Program Files\Tencent\WeMeet\3.36.1.445\
-→ {"category": "腾讯会议旧版本", "purpose": "腾讯会议旧版安装目录，可保留最新版本删除旧版", "risk": "caution"}""#
+→ {"category": "腾讯会议旧版本", "purpose": "腾讯会议旧版安装目录，可保留最新版本删除旧版", "risk": "caution"}
+
+Path: C:\Program Files\dotnet\shared\Microsoft.NETCore.App\
+→ {"category": ".NET运行时", "purpose": ".NET Core共享运行时，已安装的应用程序依赖它运行，删除会导致程序无法启动", "risk": "system"}
+
+Path: C:\Program Files\Pantum\OCR\Bin\
+→ {"category": "奔图打印机软件", "purpose": "Pantum打印机OCR组件，属于已安装的打印机驱动软件，删除会影响打印/扫描功能", "risk": "caution"}
+
+Path: C:\Program Files (x86)\ASUS\ArmouryDevice\
+→ {"category": "华硕硬件工具", "purpose": "ASUS Armoury Crate设备驱动与控制软件；如不使用应通过卸载程序移除，而非直接删目录", "risk": "caution"}
+
+Path: C:\SCANNER\ptm7100\
+→ {"category": "扫描仪驱动软件", "purpose": "奔图(Pantum)扫描仪驱动程序目录，删除会导致扫描功能不可用", "risk": "caution"}""#
         .to_string()
 }
 
@@ -428,6 +447,11 @@ Do NOT restate the extension. Be concise.
 
 IMPORTANT: Do NOT assume large .exe/.msi files are "game installers" by default.
 Consider driver installers, SDK bundles, hardware utilities, and professional software.
+
+关键反模式：不要因为"不确定"就把文件标成"临时日志/临时文件 safe"。只有当扩展名确实是
+.log/.tmp/.dmp/.etl 等、或文件位于 Temp/缓存目录时，才可标 safe。位于 Program Files\、
+软件安装目录、Steam\...\_CommonRedist 等位置下的 .exe/.dll/.dat/.bin/.emb 等，是【已安装
+软件或可再发行运行时的组成部分】→ caution（可重装）或 system（核心依赖），绝不是"临时日志"。
 
 ## Risk guidelines
 
@@ -476,7 +500,13 @@ Path: C:\NVIDIA\528.02-desktop-win10-win11-64bit.exe | 800MB | .exe
 → {"category": "NVIDIA驱动安装包", "purpose": "NVIDIA显卡驱动安装包，安装后可删除", "risk": "safe"}
 
 Path: C:\eSupport\eDriver\...\nvoptix.bi_ | 20MB | .bi_
-→ {"category": "NVIDIA组件文件", "purpose": "NVIDIA Optix光线追踪驱动组件，属于驱动安装包，可随驱动安装包删除", "risk": "safe"}""#
+→ {"category": "NVIDIA组件文件", "purpose": "NVIDIA Optix光线追踪驱动组件，属于驱动安装包，可随驱动安装包删除", "risk": "safe"}
+
+Path: C:\Program Files (x86)\Steam\steamapps\common\...\_CommonRedist\DotNet\4.8\ndp48-x86-x64-allos-enu.exe | 117MB | .exe
+→ {"category": ".NET可再发行运行时", "purpose": "游戏附带的.NET 4.8运行时安装包，删除后需要时要重新安装；不是临时日志", "risk": "caution"}
+
+Path: C:\Program Files\Pantum\OCR\Data\bcr_embeddings.emb | 89MB | .emb
+→ {"category": "打印机OCR数据文件", "purpose": "奔图打印机OCR软件的模型/字典数据，属于已安装软件组成部分，删除会影响OCR功能", "risk": "caution"}""#
         .to_string()
 }
 
