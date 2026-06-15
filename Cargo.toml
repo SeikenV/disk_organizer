@@ -1,30 +1,3 @@
-[package]
-name = "disk_organizer"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-chrono = "0.4"
-clap = { version = "4", features = ["derive"] }
-flexi_logger = "0.28"
-log = "0.4"
-mft = { version = "0.7", default-features = false }
-ollama-rs = "0.3"
-schemars = "1"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-trash = "5"
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Ioctl",
-    "Win32_System_IO",
-] }
-
-[dev-dependencies]
-tempfile = "3"
+[workspace]
+members = ["engine"]
+resolver = "2"
