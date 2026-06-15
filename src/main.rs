@@ -47,11 +47,28 @@ struct Args {
     /// Enable debug mode: verbose logs written to disk (disk_organizer.log)
     #[arg(long)]
     debug: bool,
+    /// Diagnostic: audit MFT size sources vs OS used space, then exit
+    #[arg(long)]
+    size_audit: bool,
 }
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
     init_logger(args.debug)?;
+
+    // Diagnostic short-circuit: measure where on-disk size lives.
+    if args.size_audit {
+        let drive = args.drive.clone().unwrap_or_else(|| {
+            error!("--size-audit needs a drive letter");
+            std::process::exit(2);
+        });
+        let drive = drive.trim_end_matches([':', '\\', '/']).to_ascii_uppercase();
+        info!("Reading MFT for {drive}: (size audit, requires Administrator) ...");
+        let image = disk_organizer::volume::read_mft(&drive)?;
+        disk_organizer::mft_scan::size_audit(image.bytes);
+        return Ok(());
+    }
+
     let min = args.min_size_mb.saturating_mul(1024 * 1024);
     let program_start = Instant::now();
 
