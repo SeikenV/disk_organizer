@@ -15,3 +15,11 @@ enrichment_report_*.log
 *.snapshot.json
 scan_output.txt
 *.scan.txt
+
+# External UI app build artifacts (separate toolchain, not part of the cargo workspace)
+/ui/node_modules
+/ui/dist
+/ui/build
+/ui/.expo
+/ui/android/app/build
+/ui/ios/build
