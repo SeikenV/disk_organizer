@@ -56,6 +56,7 @@ pub fn catalog() -> &'static [CatalogEntry] {
         // --- system (System: never delete) ---
         CatalogEntry { pattern: "windows/winsxs", category: "Windows component store", purpose: "Servicing store (hardlinked); manage via DISM only", risk: System },
         CatalogEntry { pattern: "windows/system32", category: "Windows system files", purpose: "Core OS files; do not delete", risk: System },
+        CatalogEntry { pattern: "windows/syswow64", category: "Windows系统文件(WOW64)", purpose: "32位系统核心文件目录；与System32同等重要，绝不能删除", risk: System },
         CatalogEntry { pattern: "system volume information", category: "System Restore / VSS", purpose: "Restore points & shadow copies; manage via System Protection, do not delete", risk: System },
         CatalogEntry { pattern: "windows/installer", category: "Windows Installer cache", purpose: "MSI/MSP cache; needed for repair/uninstall — prune with care", risk: Caution },
         CatalogEntry { pattern: "pagefile.sys", category: "Virtual memory", purpose: "Paging file; resize via System settings, do not delete", risk: System },
@@ -69,6 +70,15 @@ pub fn catalog() -> &'static [CatalogEntry] {
         CatalogEntry { pattern: "program files/common files", category: "共享安装组件", purpose: "各软件共享的安装组件；删除会破坏已安装软件", risk: System },
         CatalogEntry { pattern: "program files (x86)/common files", category: "共享安装组件", purpose: "各软件共享的安装组件；删除会破坏已安装软件", risk: System },
         CatalogEntry { pattern: "windows/microsoft.net", category: ".NET Framework", purpose: "Windows .NET Framework运行时；系统与应用依赖，不要删除", risk: System },
+        // --- installed dev toolchains / IDEs / apps (NOT build artifacts; subdirs like bin/lib/plugins are part of the install) ---
+        CatalogEntry { pattern: "program files/microsoft visual studio", category: "Visual Studio / 生成工具", purpose: "Visual Studio 及 MSVC C++ 链接库；C++/Rust 编译依赖，删除会破坏构建环境", risk: System },
+        CatalogEntry { pattern: "program files (x86)/microsoft visual studio", category: "Visual Studio / 生成工具", purpose: "Visual Studio 及 MSVC C++ 链接库；C++/Rust 编译依赖，删除会破坏构建环境", risk: System },
+        CatalogEntry { pattern: "xilinx", category: "Xilinx/Vivado 工具链", purpose: "Xilinx FPGA 开发工具(Vivado)安装；体积大但为已安装工具链，勿删子目录", risk: Caution },
+        CatalogEntry { pattern: "texlive", category: "TeX Live 发行版", purpose: "LaTeX 排版系统完整安装；如不再使用可通过卸载程序整体移除，勿删子目录", risk: Caution },
+        CatalogEntry { pattern: "program files/android/android studio", category: "Android Studio", purpose: "Android Studio IDE 安装目录；如不需要可整体卸载，勿删 plugins 等子目录", risk: Caution },
+        CatalogEntry { pattern: "program files (x86)/android/android studio", category: "Android Studio", purpose: "Android Studio IDE 安装目录；如不需要可整体卸载，勿删 plugins 等子目录", risk: Caution },
+        CatalogEntry { pattern: "program files/gnu octave", category: "GNU Octave", purpose: "GNU Octave 数值计算软件安装目录；删除 bin/lib 子目录会损坏程序", risk: Caution },
+        CatalogEntry { pattern: "program files/blackmagic design", category: "DaVinci Resolve", purpose: "Blackmagic DaVinci Resolve 视频软件安装；勿删子目录，移除请用卸载程序", risk: Caution },
         // --- Windows maintenance paths ---
         CatalogEntry { pattern: "windows/winsxs/manifestcache", category: "WinSxS清单缓存", purpose: "Windows组件存储清单缓存；可安全清理", risk: Safe },
         CatalogEntry { pattern: "windows/prefetch", category: "预读取缓存", purpose: "Windows预读取文件；系统自动管理，可安全删除", risk: Safe },
@@ -169,6 +179,8 @@ mod tests {
         assert_eq!(match_path(Path::new(r"\$MFT")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\System Volume Information")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\Windows\Installer")).unwrap().risk, Risk::Caution);
+        // SysWOW64 is core OS — both LLMs false-Safe it, so the catalog must catch it.
+        assert_eq!(match_path(Path::new(r"\Windows\SysWOW64")).unwrap().risk, Risk::System);
     }
 
     #[test]
@@ -177,6 +189,25 @@ mod tests {
         assert_eq!(match_path(Path::new(r"\Program Files\dotnet")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\Program Files\Common Files")).unwrap().risk, Risk::System);
         assert_eq!(match_path(Path::new(r"\Windows\Microsoft.NET")).unwrap().risk, Risk::System);
+    }
+
+    #[test]
+    fn installed_toolchains_not_safe() {
+        // Installed toolchains/IDEs (and their bin/lib/plugins subdirs) must never be Safe.
+        // The cut claims the whole install subtree at the root match.
+        let cases = [
+            r"\Program Files (x86)\Microsoft Visual Studio",
+            r"\Program Files\Microsoft Visual Studio",
+            r"\Xilinx",
+            r"\texlive",
+            r"\Program Files\Android\Android Studio",
+            r"\Program Files\GNU Octave",
+            r"\Program Files\Blackmagic Design",
+        ];
+        for c in cases {
+            let e = match_path(Path::new(c)).unwrap_or_else(|| panic!("no catalog match for {c}"));
+            assert_ne!(e.risk, Risk::Safe, "{c} must not be Safe (got {:?})", e.risk);
+        }
     }
 
     #[test]
