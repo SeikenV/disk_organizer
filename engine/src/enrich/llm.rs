@@ -71,7 +71,7 @@ struct ReportSchema {
 
 // ---- Tokio runtime for blocking-in-async ----
 
-fn tk_rt() -> &'static tokio::runtime::Runtime {
+pub(super) fn tk_rt() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime init"))
 }
@@ -79,7 +79,7 @@ fn tk_rt() -> &'static tokio::runtime::Runtime {
 // ---- Helpers ----
 
 /// Parse endpoint URL into an `Ollama` client.
-fn ollama_from_endpoint(endpoint: &str) -> Ollama {
+pub(super) fn ollama_from_endpoint(endpoint: &str) -> Ollama {
     let without_proto = endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://");
@@ -100,7 +100,7 @@ fn default_opts() -> ModelOptions {
 }
 
 /// Keep model alive for 10 minutes from now.
-fn keep_10m() -> KeepAlive {
+pub(super) fn keep_10m() -> KeepAlive {
     KeepAlive::Until {
         time: 10,
         unit: TimeUnit::Minutes,
@@ -131,7 +131,7 @@ fn classify_request<'a>(
 }
 
 /// Make a synchronous blocking call to Ollama.
-fn block_generate(
+pub(super) fn block_generate(
     ollama: &Ollama,
     req: GenerationRequest<'_>,
 ) -> Result<GenerationResponse, String> {
@@ -141,27 +141,6 @@ fn block_generate(
 }
 
 // ---- Public API ----
-
-/// True if an Ollama-compatible server is reachable at `endpoint`.
-pub fn health_check(endpoint: &str) -> bool {
-    let ollama = ollama_from_endpoint(endpoint);
-    tk_rt()
-        .block_on(async { ollama.list_local_models().await })
-        .is_ok()
-}
-
-/// Preload a model into GPU memory so the first real request isn't cold-start.
-///
-/// Sends a tiny generation request and sets `keep_alive` to 10 minutes.
-/// Subsequent requests with `keep_alive` will extend the lifetime.
-pub fn preload_model(endpoint: &str, model: &str) -> Result<(), String> {
-    let ollama = ollama_from_endpoint(endpoint);
-    let req = GenerationRequest::new(model.to_string(), ".")
-        .think(true)
-        .keep_alive(keep_10m());
-    block_generate(&ollama, req)?;
-    Ok(())
-}
 
 /// Ask the LLM to summarize a directory.
 pub fn summarize_dir(
