@@ -1,4 +1,4 @@
-use crate::index::Index;
+use crate::scan::index::Index;
 use crate::model::ROOT_FRN;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn reconstructs_full_path() {
-        let idx = crate::index::build_index(vec![
+        let idx = crate::scan::index::build_index(vec![
             rec(ROOT_FRN, ROOT_FRN, "", true),
             rec(10, ROOT_FRN, "Users", true),
             rec(20, 10, "x.bin", false),
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn orphan_terminates() {
-        let idx = crate::index::build_index(vec![rec(20, 999, "lost.bin", false)]);
+        let idx = crate::scan::index::build_index(vec![rec(20, 999, "lost.bin", false)]);
         let mut cache = HashMap::new();
         let p = path_for(20, &idx, &mut cache);
         assert!(p.to_string_lossy().contains("orphan:999"));
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn cycle_terminates() {
         // A(10).parent=B(11) and B(11).parent=A(10): a 2-cycle must not recurse forever.
-        let idx = crate::index::build_index(vec![
+        let idx = crate::scan::index::build_index(vec![
             rec(10, 11, "A", true),
             rec(11, 10, "B", true),
         ]);

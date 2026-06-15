@@ -1,7 +1,7 @@
 ﻿mod content;
 mod llm;
 
-use crate::index::Index;
+use crate::scan::index::Index;
 use crate::model::{Item, Source};
 use crate::report::ReportFile;
 use log::{debug, info, warn, error};
@@ -1178,7 +1178,7 @@ pub fn setup_hint() -> &'static str {
 mod tests {
     use super::*;
     use crate::consts::CWND_MIN;
-    use crate::index::build_index;
+    use crate::scan::index::build_index;
     use crate::model::{RawRecord, Risk};
 
     // ---- Helpers for work-item / index tests ----

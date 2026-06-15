@@ -1,11 +1,11 @@
 use clap::Parser;
-use disk_organizer::aggregate::aggregate;
-use disk_organizer::cut::cut;
+use disk_organizer::scan::aggregate::aggregate;
+use disk_organizer::classify::cut::cut;
 use disk_organizer::enrich::{self, is_ollama_running, LlmConfig};
-use disk_organizer::index::build_index;
+use disk_organizer::scan::index::build_index;
 use disk_organizer::model::{RawRecord, Source};
 use disk_organizer::report::{self, ReportFile};
-use disk_organizer::snapshot;
+use disk_organizer::scan::snapshot;
 use flexi_logger::{Duplicate, FileSpec, Logger, WriteMode};
 use log::{info, warn, error};
 use std::path::PathBuf;
@@ -64,8 +64,8 @@ fn main() -> std::io::Result<()> {
         });
         let drive = drive.trim_end_matches([':', '\\', '/']).to_ascii_uppercase();
         info!("Reading MFT for {drive}: (size audit, requires Administrator) ...");
-        let image = disk_organizer::volume::read_mft(&drive)?;
-        disk_organizer::mft_scan::size_audit(image.bytes);
+        let image = disk_organizer::scan::volume::read_mft(&drive)?;
+        disk_organizer::scan::mft::size_audit(image.bytes);
         return Ok(());
     }
 
@@ -89,8 +89,8 @@ fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             });
             info!("Reading MFT for {drive}: (requires Administrator) ...");
-            let image = disk_organizer::volume::read_mft(&drive)?;
-            (drive, disk_organizer::mft_scan::parse_records(image.bytes))
+            let image = disk_organizer::scan::volume::read_mft(&drive)?;
+            (drive, disk_organizer::scan::mft::parse_records(image.bytes))
         }
     };
     let drive = drive.trim_end_matches([':', '\\', '/']).to_ascii_uppercase();

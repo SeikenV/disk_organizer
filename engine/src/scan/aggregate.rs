@@ -1,4 +1,4 @@
-use crate::index::Index;
+use crate::scan::index::Index;
 use crate::model::{DirAgg, ROOT_FRN};
 use std::collections::{HashMap, HashSet};
 
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn rolls_sizes_up_the_tree() {
         // root(5) > Users(10) > {a(20)=100, b(21)=50}
-        let idx = crate::index::build_index(vec![
+        let idx = crate::scan::index::build_index(vec![
             dir(10, ROOT_FRN), file(20, 10, 100), file(21, 10, 50),
         ]);
         let totals = aggregate(&idx);

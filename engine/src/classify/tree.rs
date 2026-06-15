@@ -1,4 +1,4 @@
-use crate::index::Index;
+use crate::scan::index::Index;
 use crate::model::{DirAgg, RawRecord};
 use std::collections::HashMap;
 
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn files_sorted_filtered_capped() {
-        let idx = crate::index::build_index(vec![
+        let idx = crate::scan::index::build_index(vec![
             file(20, ROOT_FRN, 1000), file(21, ROOT_FRN, 200), file(22, ROOT_FRN, 5),
         ]);
         let top = top_n_files(&idx, 100, 5);

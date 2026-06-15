@@ -1,7 +1,7 @@
-use crate::catalog::match_path;
-use crate::index::Index;
+use crate::classify::catalog::match_path;
+use crate::scan::index::Index;
 use crate::model::{DirAgg, Item, Risk, Source, ROOT_FRN};
-use crate::paths::path_for;
+use crate::scan::paths::path_for;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -245,8 +245,8 @@ mod tests {
             dir(15, 11, "myapp"),
             file(21, 15, "big.bin", 800),
         ];
-        let index = crate::index::build_index(records);
-        let totals = crate::aggregate::aggregate(&index);
+        let index = crate::scan::index::build_index(records);
+        let totals = crate::scan::aggregate::aggregate(&index);
         (index, totals)
     }
 
@@ -269,8 +269,8 @@ mod tests {
     fn root_level_system_file_uses_catalog() {
         // A big file directly under root (e.g. pagefile.sys / $MFT) must be
         // classified by the catalog, not the generic extension heuristic.
-        let index = crate::index::build_index(vec![file(30, ROOT_FRN, "$MFT", 5000)]);
-        let totals = crate::aggregate::aggregate(&index);
+        let index = crate::scan::index::build_index(vec![file(30, ROOT_FRN, "$MFT", 5000)]);
+        let totals = crate::scan::aggregate::aggregate(&index);
         let items = cut(&index, &totals, 100);
         let mft = items.iter().find(|i| i.path.ends_with("$MFT")).expect("$MFT item");
         assert_eq!(mft.source, Source::Rule);
@@ -286,8 +286,8 @@ mod tests {
             dir(11, 10, "myapp"),
             file(21, 11, "big.bin", 800),
         ];
-        let index = crate::index::build_index(records);
-        let totals = crate::aggregate::aggregate(&index);
+        let index = crate::scan::index::build_index(records);
+        let totals = crate::scan::aggregate::aggregate(&index);
         let items = cut(&index, &totals, 100);
         let big = items.iter().find(|i| i.path.ends_with("big.bin")).expect("big.bin item");
         assert_eq!(big.source, Source::Heuristic);

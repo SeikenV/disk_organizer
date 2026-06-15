@@ -1,7 +1,7 @@
 //! Directory content analysis: for known-category directories, inspect
 //! actual children and append observations to the purpose field.
 
-use crate::index::Index;
+use crate::scan::index::Index;
 use crate::model::Item;
 use std::collections::HashMap;
 
@@ -116,7 +116,7 @@ fn file_ext_category(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::build_index;
+    use crate::scan::index::build_index;
     use crate::model::RawRecord;
 
     fn dir(frn: u64, parent: u64, name: &str) -> RawRecord {
