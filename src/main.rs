@@ -38,8 +38,8 @@ struct Args {
     /// Fraction of threads for iGPU backend (0.0-1.0, default: 0.3)
     #[arg(long, default_value_t = 0.3)]
     llm_igpu_weight: f64,
-    /// Override LLM model (default: qwen3.5:0.8b)
-    #[arg(long, default_value = "qwen3.5:0.8b")]
+    /// Override LLM model (default: qwen35-q4ud:0.8b)
+    #[arg(long, default_value = "qwen35-q4ud:0.8b")]
     llm_model: String,
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]

@@ -59,7 +59,7 @@ impl Default for LlmConfig {
             endpoint: "http://localhost:11434".into(),
             igpu_endpoint: None,
             igpu_weight: 0.3,
-            model: "qwen3.5:0.8b".into(),
+            model: "qwen35-q4ud:0.8b".into(),
             sample_count: 20,
         }
     }
