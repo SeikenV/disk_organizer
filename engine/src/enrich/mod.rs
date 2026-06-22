@@ -1,4 +1,5 @@
 ﻿mod backend;
+mod client;
 mod content;
 mod lifecycle;
 mod llm;
