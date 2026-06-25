@@ -40,6 +40,18 @@ impl LlamaServer {
             return Err(format!("llama-server not found: {}", exe.display()));
         }
         let ctx = super::server::total_context(cfg.parallel, cfg.per_slot_ctx);
+        // Guard the per-slot-context rule: each slot must hold a typical prompt
+        // plus its output, or requests fail with "exceeds context size". Our
+        // real classification prompts run ~1645 tokens + ~300 output.
+        const TYPICAL_PROMPT_TOKENS: usize = 1645;
+        const TYPICAL_OUTPUT_TOKENS: usize = 300;
+        if !fits_slot(cfg.per_slot_ctx, TYPICAL_PROMPT_TOKENS, TYPICAL_OUTPUT_TOKENS) {
+            log::warn!(
+                "[LLM] per_slot_ctx={} is below a typical prompt+output ({}+{} tokens); \
+                 requests may fail. Raise --llm-per-slot-ctx or lower --llm-parallel.",
+                cfg.per_slot_ctx, TYPICAL_PROMPT_TOKENS, TYPICAL_OUTPUT_TOKENS,
+            );
+        }
         let mut cmd = Command::new(&exe);
         cmd.arg("-m").arg(&cfg.model_path)
             .arg("--host").arg("127.0.0.1")

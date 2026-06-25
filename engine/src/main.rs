@@ -1,7 +1,7 @@
 use clap::Parser;
 use disk_organizer::scan::aggregate::aggregate;
 use disk_organizer::classify::cut::cut;
-use disk_organizer::enrich::{self, is_ollama_running, LlmConfig};
+use disk_organizer::enrich::{self, Backend, LlmConfig};
 use disk_organizer::scan::index::build_index;
 use disk_organizer::model::{RawRecord, Source};
 use disk_organizer::report::{self, ReportFile};
@@ -26,21 +26,31 @@ struct Args {
     /// Analyze a saved snapshot instead of reading the MFT (no admin needed)
     #[arg(long)]
     from_snapshot: Option<PathBuf>,
-    /// Use a local LLM (Ollama) to classify unknown directories
+    /// Use a local LLM (llama-server) to classify unknown directories
     #[arg(long)]
     llm: bool,
-    /// Override LLM endpoint (default: http://localhost:11434)
-    #[arg(long, default_value = "http://localhost:11434")]
-    llm_endpoint: String,
-    /// Optional iGPU/CPU inference endpoint (e.g. llama-server on port 8080)
-    #[arg(long)]
-    llm_igpu_endpoint: Option<String>,
-    /// Fraction of threads for iGPU backend (0.0-1.0, default: 0.3)
-    #[arg(long, default_value_t = 0.3)]
-    llm_igpu_weight: f64,
-    /// Override LLM model (default: qwen35-q4ud:0.8b)
-    #[arg(long, default_value = "qwen35-q4ud:0.8b")]
-    llm_model: String,
+    /// Path to the GGUF model llama-server loads
+    #[arg(long, default_value = "tools/models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")]
+    llm_model_path: PathBuf,
+    /// Directory of per-backend llama-server binaries (<dir>/<backend>/llama-server)
+    #[arg(long, default_value = "tools/llamacpp")]
+    tools_dir: PathBuf,
+    /// Backend preference order (repeatable): cuda, vulkan, cpu.
+    /// Omit to use cuda,vulkan,cpu with fallback.
+    #[arg(long = "backend")]
+    backend: Vec<String>,
+    /// Number of llama-server slots (--parallel) and concurrency ceiling
+    #[arg(long, default_value_t = 4)]
+    llm_parallel: usize,
+    /// Context tokens per slot (total -c = parallel × this)
+    #[arg(long, default_value_t = 4096)]
+    llm_per_slot_ctx: usize,
+    /// GPU layers to offload (-ngl); ignored on the CPU backend
+    #[arg(long, default_value_t = 999)]
+    llm_ngl: u32,
+    /// Port llama-server listens on
+    #[arg(long, default_value_t = 8080)]
+    llm_port: u16,
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
@@ -147,23 +157,25 @@ fn main() -> std::io::Result<()> {
     let mut enrich_report: Option<ReportFile> = None;
     if args.llm {
         let config = LlmConfig {
-            endpoint: args.llm_endpoint.clone(),
-            igpu_endpoint: args.llm_igpu_endpoint.clone(),
-            igpu_weight: args.llm_igpu_weight,
-            model: args.llm_model.clone(),
+            model_path: args.llm_model_path.clone(),
+            tools_dir: args.tools_dir.clone(),
+            backend_prefs: parse_backends(&args.backend),
+            parallel: args.llm_parallel,
+            per_slot_ctx: args.llm_per_slot_ctx,
+            ngl: args.llm_ngl,
+            port: args.llm_port,
             sample_count: args.llm_samples,
         };
-        if is_ollama_running(&config.endpoint) {
-            match ReportFile::create() {
-                Ok(rf) => { enrich_report = Some(rf); }
-                Err(e) => warn!("cannot create report file: {e}"),
-            }
-            let t0 = Instant::now();
-            enrich::enrich_items(&config, &mut items, &index, &mut enrich_report);
-            timings.push(("llm_enrich", t0.elapsed()));
-        } else {
-            info!("{}", enrich::setup_hint());
+        // enrich_items owns the llama-server lifecycle: it starts the backend
+        // (with CUDA→Vulkan→CPU fallback), enriches, and shuts it down. If no
+        // backend can start it logs a hint and leaves rule/heuristic results.
+        match ReportFile::create() {
+            Ok(rf) => { enrich_report = Some(rf); }
+            Err(e) => warn!("cannot create report file: {e}"),
         }
+        let t0 = Instant::now();
+        enrich::enrich_items(&config, &mut items, &index, &mut enrich_report);
+        timings.push(("llm_enrich", t0.elapsed()));
     }
 
     // 3. Output JSON to stdout.
@@ -200,6 +212,28 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Map repeatable `--backend` strings to a preference list, falling back to the
+/// default order (cuda → vulkan → cpu) when none are given or all are invalid.
+fn parse_backends(names: &[String]) -> Vec<Backend> {
+    let prefs: Vec<Backend> = names
+        .iter()
+        .filter_map(|n| match n.to_ascii_lowercase().as_str() {
+            "cuda" => Some(Backend::Cuda),
+            "vulkan" => Some(Backend::Vulkan),
+            "cpu" => Some(Backend::Cpu),
+            other => {
+                warn!("ignoring unknown --backend '{other}' (expected cuda|vulkan|cpu)");
+                None
+            }
+        })
+        .collect();
+    if prefs.is_empty() {
+        enrich::default_prefs()
+    } else {
+        prefs
+    }
 }
 
 fn init_logger(debug: bool) -> std::io::Result<()> {
