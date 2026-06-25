@@ -77,7 +77,7 @@ impl LlamaServer {
     fn wait_healthy(&self, timeout: Duration) -> Result<(), String> {
         let url = format!("{}/health", self.endpoint);
         let deadline = Instant::now() + timeout;
-        let http = reqwest::blocking::Client::new();
+        let http = super::client::local_client();
         while Instant::now() < deadline {
             if let Ok(r) = http.get(&url).timeout(Duration::from_secs(2)).send() {
                 if r.status().is_success() {

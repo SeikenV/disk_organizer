@@ -2,6 +2,20 @@
 
 use serde_json::{json, Value};
 
+/// A blocking HTTP client for talking to the local llama-server.
+///
+/// `.no_proxy()` is essential: llama-server listens on 127.0.0.1, but reqwest
+/// auto-detects the Windows system proxy. If a local proxy (e.g. Clash on
+/// 127.0.0.1:7890) is enabled, our loopback requests would be routed through it
+/// and hang — which previously made the health check time out even though the
+/// server was already listening.
+pub fn local_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build blocking client")
+}
+
 /// Build the chat-completions request body for a JSON-schema-constrained reply
 /// with the model's reasoning phase disabled.
 pub fn build_json_body(system: &str, user: &str, schema: Value, max_tokens: u32) -> Value {
@@ -19,7 +33,7 @@ pub fn build_json_body(system: &str, user: &str, schema: Value, max_tokens: u32)
 
 /// POST a chat request and return the assistant message `content`.
 pub fn chat(endpoint: &str, body: &Value) -> Result<String, String> {
-    let http = reqwest::blocking::Client::new();
+    let http = local_client();
     let resp = http
         .post(format!("{endpoint}/v1/chat/completions"))
         .json(body)

@@ -11,7 +11,7 @@
 /// llama-server answers `GET /health` with `200 {"status":"ok"}` once the model
 /// is loaded (and `503` while still loading), so a 2xx here means ready to serve.
 pub fn health_check(endpoint: &str) -> bool {
-    let http = reqwest::blocking::Client::new();
+    let http = crate::enrich::client::local_client();
     http.get(format!("{endpoint}/health"))
         .timeout(std::time::Duration::from_secs(5))
         .send()
