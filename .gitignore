@@ -5,6 +5,9 @@
 /references
 /ollama-rs
 
+# Project-managed tools fetched by scripts/setup_tools.ps1 (llama.cpp binaries + GGUF models)
+/tools
+
 # Runtime logs and probe/analysis outputs
 /logs
 enrichment_probe_log.json
