@@ -1,25 +1,16 @@
-// Ollama LLM client — uses ollama-rs community crate.
+// LLM prompts + request building for the llama-server backend.
 //
-//   https://github.com/pepperoni21/ollama-rs
+// The actual HTTP transport lives in `client.rs` (OpenAI-compatible
+// `/v1/chat/completions`).  This module owns the domain types, the JSON
+// schemas, the system prompts/few-shots, and the parsing of model output.
 //
-// Replaces the hand-rolled reqwest calls with the official community library.
-//
-// Key API features used:
-//   * `think(false)` — disables reasoning phase (top-level param).
-//   * `format(FormatType::Json)` / `format(schema_value)` — structured output.
-//   * `.system(...)` — system prompt as proper field.
-//   * `keep_alive(KeepAlive::Until { timestamp: ... })` — keep model loaded.
-//   * `options(ModelOptions::default().temperature(0.1).num_predict(300))` — gen params.
+// Structured output is constrained via `response_format: json_schema` and the
+// reasoning phase is disabled via `chat_template_kwargs.enable_thinking=false`
+// (both set by `client::build_json_body`).
 
-use ollama_rs::generation::completion::request::GenerationRequest;
-use ollama_rs::generation::completion::GenerationResponse;
-use ollama_rs::generation::parameters::{FormatType, JsonStructure, KeepAlive, TimeUnit};
-use ollama_rs::models::ModelOptions;
-use ollama_rs::Ollama;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
-use std::time::Duration;
+use serde_json::Value;
 
 // ---- Our domain types ----
 
@@ -41,12 +32,13 @@ pub struct FinalReport {
 
 // ---- JSON Schemas for structured output ----
 //
-// We derive schemars::JsonSchema on empty structs whose field names + types
-// match the JSON shape we want Ollama to produce.  ollama-rs serializes these
-// as the request's `format` parameter via FormatType::StructuredJson.
+// We derive schemars::JsonSchema on structs whose field names + types match the
+// JSON shape we want the model to produce.  `dir_schema()`/`report_schema()`
+// serialize these to a `serde_json::Value` passed as the request's
+// `response_format.json_schema.schema` (see client.rs).
 //
-// Note: the derive places `"additionalProperties": false` by default.
-// Ollama handles this fine, but if a model ever chokes we can relax it.
+// Note: the derive places `"additionalProperties": false` by default, which
+// llama-server's grammar-constrained sampling handles fine.
 // The `allow(dead_code)` silences warnings — fields are only read by the derive macro.
 
 #[allow(dead_code)]
@@ -69,75 +61,18 @@ struct ReportSchema {
     cleanup_plan: Vec<String>,
 }
 
-// ---- Tokio runtime for blocking-in-async ----
+// ---- JSON schema helpers ----
 
-pub(super) fn tk_rt() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime init"))
+/// JSON Schema for a directory/file classification (`{category, purpose, risk}`).
+fn dir_schema() -> Value {
+    serde_json::to_value(schemars::schema_for!(DirSummarySchema))
+        .expect("DirSummarySchema serializes")
 }
 
-// ---- Helpers ----
-
-/// Parse endpoint URL into an `Ollama` client.
-pub(super) fn ollama_from_endpoint(endpoint: &str) -> Ollama {
-    let without_proto = endpoint
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    if let Some(colon_pos) = without_proto.rfind(':') {
-        let host = format!("http://{}", &without_proto[..colon_pos]);
-        let port: u16 = without_proto[colon_pos + 1..].parse().unwrap_or(11434);
-        Ollama::new(host, port)
-    } else {
-        Ollama::default()
-    }
-}
-
-/// Default model options for classification tasks.
-fn default_opts() -> ModelOptions {
-    ModelOptions::default()
-        .temperature(0.1_f32)
-        .num_predict(300)
-}
-
-/// Keep model alive for 10 minutes from now.
-pub(super) fn keep_10m() -> KeepAlive {
-    KeepAlive::Until {
-        time: 10,
-        unit: TimeUnit::Minutes,
-    }
-}
-
-fn dir_format() -> FormatType {
-    FormatType::StructuredJson(Box::new(JsonStructure::new::<DirSummarySchema>()))
-}
-
-fn report_format() -> FormatType {
-    FormatType::StructuredJson(Box::new(JsonStructure::new::<ReportSchema>()))
-}
-
-/// Build a GenerationRequest with common settings.
-fn classify_request<'a>(
-    model: &'a str,
-    system: &'a str,
-    prompt: &'a str,
-    format: FormatType,
-) -> GenerationRequest<'a> {
-    GenerationRequest::new(model.to_string(), prompt.to_string())
-        .system(system.to_string())
-        .think(false)
-        .format(format)
-        .options(default_opts())
-        .keep_alive(keep_10m())
-}
-
-/// Make a synchronous blocking call to Ollama.
-pub(super) fn block_generate(
-    ollama: &Ollama,
-    req: GenerationRequest<'_>,
-) -> Result<GenerationResponse, String> {
-    tk_rt()
-        .block_on(async { ollama.generate(req).await })
-        .map_err(|e| format!("Ollama error: {e}"))
+/// JSON Schema for the holistic final report.
+fn report_schema() -> Value {
+    serde_json::to_value(schemars::schema_for!(ReportSchema))
+        .expect("ReportSchema serializes")
 }
 
 // ---- Public API ----
@@ -145,7 +80,7 @@ pub(super) fn block_generate(
 /// Ask the LLM to summarize a directory.
 pub fn summarize_dir(
     endpoint: &str,
-    model: &str,
+    _model: &str,
     dir_path: &str,
     sample_entries: &[String],
     ancestor_context: Option<&str>,
@@ -171,16 +106,15 @@ pub fn summarize_dir(
     );
     let system = system_prompt_dir();
 
-    let ollama = ollama_from_endpoint(endpoint);
-    let req = classify_request(model, &system, &user, dir_format());
-    let raw = block_generate(&ollama, req)?.response;
+    let body = crate::enrich::client::build_json_body(&system, &user, dir_schema(), 300);
+    let raw = crate::enrich::client::chat(endpoint, &body)?;
     parse_summary(&raw)
 }
 
 /// Ask the LLM to analyze a large file.
 pub fn summarize_file(
     endpoint: &str,
-    model: &str,
+    _model: &str,
     file_path: &str,
     parent_dir: &str,
     sibling_files: &[String],
@@ -201,16 +135,15 @@ pub fn summarize_file(
     );
     let system = system_prompt_file();
 
-    let ollama = ollama_from_endpoint(endpoint);
-    let req = classify_request(model, &system, &user, dir_format());
-    let raw = block_generate(&ollama, req)?.response;
+    let body = crate::enrich::client::build_json_body(&system, &user, dir_schema(), 300);
+    let raw = crate::enrich::client::chat(endpoint, &body)?;
     parse_summary(&raw)
 }
 
 /// Ask the LLM for a holistic summary and cleanup plan.
 pub fn summarize_report(
     endpoint: &str,
-    model: &str,
+    _model: &str,
     safe_items: &[DirSummary],
     caution_items: &[DirSummary],
     system_items: &[DirSummary],
@@ -262,57 +195,24 @@ pub fn summarize_report(
         "Disk scan complete. {total_size_mb:.1} MB analyzed across all items.\n\n{safe_b}\n\n{caution_b}\n\n{system_b}\n\n{unknown_b}"
     );
 
-    let ollama = ollama_from_endpoint(endpoint);
-    let req = GenerationRequest::new(model.to_string(), user_prompt)
-        .system(system_prompt_report())
-        .think(true)
-        .format(report_format())
-        .options(
-            ModelOptions::default()
-                .temperature(0.1_f32)
-                // Cap output at 4096 tokens — -1 (unlimited) risks runaway
-                // generation that hits the timeout before producing valid JSON.
-                .num_predict(4096)
-                // Default 2048 is far too small — report prompt may be 15K+
-                // tokens (all categorized items).  32K gives breathing room.
-                .num_ctx(32768),
-        )
-        .keep_alive(keep_10m());
-
-    // The report may take longer; wrap in a timeout.
-    let result = tk_rt().block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(crate::consts::REPORT_TIMEOUT.as_secs()),
-            ollama.generate(req),
-        )
-        .await
-    });
-
-    match result {
-        Ok(Ok(resp)) => {
-            // With `think: true`, qwen models fill BOTH `thinking`
-            // (reasoning) and `response` (final answer) when given
-            // sufficient token budget.  Fall back to `thinking` only
-            // when `response` is empty (e.g. token limit hit during
-            // the thinking phase).
-            let used_field = if resp.response.is_empty() { "thinking" } else { "response" };
-            let text: &str = if resp.response.is_empty() {
-                resp.thinking.as_deref().unwrap_or(&resp.response)
-            } else {
-                &resp.response
-            };
-            // Quick sanity log: which field, how long, and a peek at the start.
-            log::info!(
-                "[LLM] Report final response: used={used_field} len={} done={} preview={:.80}",
-                text.len(),
-                resp.done,
-                text.chars().take(80).collect::<String>(),
-            );
-            parse_final_report(text)
-        }
-        Ok(Err(e)) => Err(format!("Ollama error: {e}")),
-        Err(_elapsed) => Err("Report generation timed out".to_string()),
-    }
+    // The report prompt is bounded (mod.rs caps items to the top-N per group),
+    // so it fits the per-slot context; `enable_thinking=false` keeps the answer
+    // in `content` (no reasoning phase to drain into `thinking`).  Output is
+    // capped at 1024 tokens — enough for overview + summaries + cleanup plan
+    // while leaving headroom in a 4096-token slot.
+    let body = crate::enrich::client::build_json_body(
+        &system_prompt_report(),
+        &user_prompt,
+        report_schema(),
+        1024,
+    );
+    let raw = crate::enrich::client::chat(endpoint, &body)?;
+    log::info!(
+        "[LLM] Report response: len={} preview={:.80}",
+        raw.len(),
+        raw.chars().take(80).collect::<String>(),
+    );
+    parse_final_report(&raw)
 }
 
 // ---- System prompts ----
