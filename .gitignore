@@ -12,6 +12,8 @@
 /logs
 enrichment_probe_log.json
 analysis_result.json
+video_analysis_result.json
+predictions_*.json
 enrichment_report_*.log
 
 # Local scan snapshots / output (contain personal disk listings)

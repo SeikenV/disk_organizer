@@ -624,8 +624,10 @@ fn collect_work(items: &[Item], index: &Index, sample_count: usize) -> Vec<WorkI
                 });
             }
         } else {
-            // Heuristic files get LLM re-analysis for deeper understanding.
-            if it.source == Source::Heuristic {
+            // Video files are already marked "Video" by the cut; the text LLM
+            // can't see their content, so we skip them here and let the VLM
+            // (describe_video) refine them separately into video_analysis_result.
+            if it.source == Source::Heuristic && !video::is_video_path(&it.path) {
                 let (parent_dir, siblings) = parent_context(it.frn, index);
                 let ancestor_context = find_ancestor_context(it.frn, index);
                 let ext = it
@@ -900,6 +902,44 @@ mod tests {
         let work = collect_work(&items, &index, 5);
         assert_eq!(work.len(), 1);
         assert!(matches!(work[0].kind, WorkKind::File { .. }));
+    }
+
+    #[test]
+    fn collect_work_skips_video_files() {
+        // Video files are marked by the cut and handled by the VLM, not the
+        // text LLM — so they must NOT appear as text-enrichment work.
+        let index = build_index(vec![
+            dir(10, 5, "Downloads"),
+            file(20, 10, "movie.mkv", 5000),
+            file(21, 10, "data.bin", 5000),
+        ]);
+        let items = vec![
+            Item {
+                frn: 20,
+                path: PathBuf::from(r"C:\Downloads\movie.mkv"),
+                is_dir: false,
+                physical_size: 5000,
+                file_count: 1,
+                category: "Video".into(),
+                purpose: "Video file".into(),
+                risk: Risk::Caution,
+                source: Source::Heuristic,
+            },
+            Item {
+                frn: 21,
+                path: PathBuf::from(r"C:\Downloads\data.bin"),
+                is_dir: false,
+                physical_size: 5000,
+                file_count: 1,
+                category: "Data/cache".into(),
+                purpose: "Binary data".into(),
+                risk: Risk::Unknown,
+                source: Source::Heuristic,
+            },
+        ];
+        let work = collect_work(&items, &index, 5);
+        assert_eq!(work.len(), 1, "only the non-video file is enrichment work");
+        assert!(work[0].path.ends_with("data.bin"));
     }
 
     #[test]
