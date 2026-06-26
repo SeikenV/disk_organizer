@@ -1,9 +1,9 @@
 use clap::Parser;
 use disk_organizer::scan::aggregate::aggregate;
 use disk_organizer::classify::cut::cut;
-use disk_organizer::enrich::{self, Backend, LlmConfig, VideoConfig};
+use disk_organizer::enrich::{self, Backend, LlmConfig, VideoConfig, VisionSession};
 use disk_organizer::scan::index::build_index;
-use disk_organizer::model::{RawRecord, Source};
+use disk_organizer::model::{Item, RawRecord, Source};
 use disk_organizer::report::{self, ReportFile};
 use disk_organizer::scan::snapshot;
 use flexi_logger::{Duplicate, FileSpec, Logger, WriteMode};
@@ -54,9 +54,14 @@ struct Args {
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
-    /// Look inside a video and describe what it probably contains, then exit
+    /// Look inside a video and describe what it probably contains, then exit.
+    /// Repeatable; all videos share one llama-server.
     #[arg(long)]
-    describe_video: Option<PathBuf>,
+    describe_video: Vec<PathBuf>,
+    /// Describe every video file found in an enrichment-result JSON (the engine's
+    /// item array), reusing one llama-server. Prints a JSON array of guesses.
+    #[arg(long)]
+    describe_videos_from: Option<PathBuf>,
     /// GGUF vision model llama-server loads for --describe-video
     #[arg(long, default_value = "tools/models/SmolVLM2-500M-Video-Instruct-Q8_0.gguf")]
     vlm_model_path: PathBuf,
@@ -108,8 +113,13 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // Diagnostic short-circuit: describe a single video, print JSON, exit.
-    if let Some(video) = args.describe_video.clone() {
+    // Diagnostic short-circuit: describe video(s) via ONE vision server, exit.
+    if !args.describe_video.is_empty() || args.describe_videos_from.is_some() {
+        let videos = collect_videos(&args.describe_video, &args.describe_videos_from)?;
+        if videos.is_empty() {
+            error!("describe-video: no video files to describe");
+            std::process::exit(1);
+        }
         let cfg = VideoConfig {
             model_path: args.vlm_model_path.clone(),
             mmproj_path: args.vlm_mmproj_path.clone(),
@@ -123,17 +133,57 @@ fn main() -> std::io::Result<()> {
             max_frames: args.vlm_max_frames,
             shrink: if args.vlm_downscale == 0 { None } else { Some(args.vlm_downscale) },
         };
-        match enrich::describe_video(&video, &cfg) {
-            Ok(guess) => {
-                let json = serde_json::to_string_pretty(&guess)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                println!("{json}");
-            }
+        // Lifecycle lives here: start the server once, describe many, drop.
+        let session = match VisionSession::start(cfg) {
+            Ok(s) => s,
             Err(e) => {
                 error!("describe-video failed: {e}");
                 std::process::exit(1);
             }
+        };
+
+        // One explicit video and no batch source → print just the guess object.
+        let single = args.describe_videos_from.is_none() && videos.len() == 1;
+        if single {
+            match session.describe(&videos[0]) {
+                Ok(guess) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&guess)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                ),
+                Err(e) => {
+                    error!("describe-video failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
         }
+
+        // Otherwise print a JSON array of {path, ...guess} (or {path, error}).
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(videos.len());
+        for (i, video) in videos.iter().enumerate() {
+            let path_str = video.display().to_string();
+            info!("[VLM] ({}/{}) {}", i + 1, videos.len(), path_str);
+            match session.describe(video) {
+                Ok(guess) => {
+                    let mut v = serde_json::to_value(&guess)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    if let Some(m) = v.as_object_mut() {
+                        m.insert("path".into(), serde_json::Value::String(path_str));
+                    }
+                    out.push(v);
+                }
+                Err(e) => {
+                    warn!("describe-video failed for {path_str}: {e}");
+                    out.push(serde_json::json!({"path": path_str, "error": e}));
+                }
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        );
         return Ok(());
     }
 
@@ -270,6 +320,30 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Gather video paths to describe: the explicit `--describe-video` paths plus
+/// every video file found in a `--describe-videos-from` enrichment-result JSON.
+/// De-duplicates while preserving order.
+fn collect_videos(explicit: &[PathBuf], from: &Option<PathBuf>) -> std::io::Result<Vec<PathBuf>> {
+    let mut videos: Vec<PathBuf> = explicit.to_vec();
+    if let Some(path) = from {
+        let text = std::fs::read_to_string(path)?;
+        let items: Vec<Item> = serde_json::from_str(&text).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("parsing {}: {e}", path.display()),
+            )
+        })?;
+        for it in items {
+            if !it.is_dir && enrich::is_video_path(&it.path) {
+                videos.push(it.path);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    videos.retain(|p| seen.insert(p.clone()));
+    Ok(videos)
 }
 
 /// Map repeatable `--backend` strings to a preference list, falling back to the

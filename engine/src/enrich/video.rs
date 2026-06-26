@@ -4,13 +4,14 @@
 
 use super::backend::Backend;
 use super::frames;
-use super::server::{start_with_fallback, ServerConfig};
+use super::server::{start_with_fallback, LlamaServer, ServerConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Inputs for `describe_video`. VLM-prefixed CLI flags map onto these fields.
+/// Inputs for a `VisionSession`. VLM-prefixed CLI flags map onto these fields.
 pub struct VideoConfig {
     pub model_path: PathBuf,
     pub mmproj_path: PathBuf,
@@ -98,61 +99,98 @@ montage grid of frames sampled evenly from one video file. Guess what the video 
 most likely contains. This is a GUESS, not confirmation (推测，非确证). Reply ONLY \
 with JSON matching the schema: a one-sentence summary, a category, and confidence.";
 
-/// Sample frames from `path`, ask the SmolVLM2 server what it contains.
-pub fn describe_video(path: &Path, cfg: &VideoConfig) -> Result<VideoContentGuess, String> {
-    if !path.exists() {
-        return Err(format!("video not found: {}", path.display()));
+/// File extensions treated as video for `--describe-videos-from` filtering.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "mov", "avi", "webm", "m4v", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts",
+];
+
+/// True if `path` has a known video extension (case-insensitive).
+pub fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            VIDEO_EXTS.contains(&e.as_str())
+        })
+        .unwrap_or(false)
+}
+
+/// Unique-per-call montage filename suffix, so concurrent describes don't clash.
+static MONTAGE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A running vision model: owns the `llama-server` lifecycle (start on
+/// `start`, load model + mmproj, shut down on `Drop`). Reuse one session to
+/// `describe` many videos — describing only writes prompts to this server.
+pub struct VisionSession {
+    server: LlamaServer,
+    cfg: VideoConfig,
+}
+
+impl VisionSession {
+    /// Start the vision `llama-server` (loads the model + mmproj). The server
+    /// stays up until the session is dropped, so callers reuse it across videos.
+    pub fn start(cfg: VideoConfig) -> Result<VisionSession, String> {
+        let ffmpeg = tool_exe(&cfg.ffmpeg_dir, "ffmpeg");
+        let ffprobe = tool_exe(&cfg.ffmpeg_dir, "ffprobe");
+        if !ffmpeg.exists() || !ffprobe.exists() {
+            return Err(format!(
+                "ffmpeg/ffprobe not found in {} — run scripts/setup_tools.ps1",
+                cfg.ffmpeg_dir.display()
+            ));
+        }
+        let server_cfg = ServerConfig {
+            model_path: cfg.model_path.clone(),
+            tools_dir: cfg.tools_dir.clone(),
+            port: cfg.port,
+            parallel: 1,
+            per_slot_ctx: VISION_CTX,
+            ngl: cfg.ngl,
+            mmproj: Some(cfg.mmproj_path.clone()),
+        };
+        let (backend, server) = start_with_fallback(&cfg.backend_prefs, &server_cfg)
+            .map_err(|e| format!("could not start the video model: {e}"))?;
+        log::info!("[VLM] video model up on {backend:?}");
+        Ok(VisionSession { server, cfg })
     }
-    let ffprobe = tool_exe(&cfg.ffmpeg_dir, "ffprobe");
-    let ffmpeg = tool_exe(&cfg.ffmpeg_dir, "ffmpeg");
-    if !ffmpeg.exists() || !ffprobe.exists() {
-        return Err(format!(
-            "ffmpeg/ffprobe not found in {} — run scripts/setup_tools.ps1",
-            cfg.ffmpeg_dir.display()
-        ));
+
+    /// Describe one video using the already-running server (prompting only:
+    /// sample frames → montage → ask → parse). Does not touch the server's
+    /// lifecycle.
+    pub fn describe(&self, path: &Path) -> Result<VideoContentGuess, String> {
+        if !path.exists() {
+            return Err(format!("video not found: {}", path.display()));
+        }
+        let ffprobe = tool_exe(&self.cfg.ffmpeg_dir, "ffprobe");
+        let ffmpeg = tool_exe(&self.cfg.ffmpeg_dir, "ffmpeg");
+
+        // 1. Decide how many frames, build the montage.
+        let meta = frames::probe_video(&ffprobe, path)?;
+        let count = frames::frames_to_sample(
+            meta.total_frames,
+            self.cfg.frame_fraction,
+            self.cfg.min_frames,
+            self.cfg.max_frames,
+        );
+        let seq = MONTAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let montage_path = std::env::temp_dir()
+            .join(format!("disk_org_montage_{}_{}.png", std::process::id(), seq));
+        let montage = TempPng(montage_path);
+        frames::build_montage(&ffmpeg, path, meta.duration_secs, count, self.cfg.shrink, &montage.0)?;
+        let png = std::fs::read(&montage.0).map_err(|e| format!("read montage: {e}"))?;
+        log::info!("[VLM] {count} frames sampled from {}", path.display());
+
+        // 2. Ask, parse. Deliberately omit the filename: the goal is to describe
+        // opaquely-named videos from their frames, and including the name makes a
+        // small model echo it instead of describing what it sees.
+        let user = format!(
+            "Here is a montage of {count} frames sampled evenly from one video. \
+             Describe what the video most likely contains, based only on the frames."
+        );
+        let body =
+            super::client::build_image_request(VISION_SYSTEM, &user, &png, guess_schema(), 256);
+        let raw = super::client::chat(self.server.endpoint(), &body)?;
+        parse_video_guess(&raw)
     }
-
-    // 1. Decide how many frames, build the montage.
-    let meta = frames::probe_video(&ffprobe, path)?;
-    let count = frames::frames_to_sample(
-        meta.total_frames,
-        cfg.frame_fraction,
-        cfg.min_frames,
-        cfg.max_frames,
-    );
-    let montage_path = std::env::temp_dir()
-        .join(format!("disk_org_montage_{}.png", std::process::id()));
-    let montage = TempPng(montage_path);
-    frames::build_montage(&ffmpeg, path, meta.duration_secs, count, cfg.shrink, &montage.0)?;
-    let png = std::fs::read(&montage.0).map_err(|e| format!("read montage: {e}"))?;
-
-    // 2. Start the vision server (owned; Drop kills it).
-    let server_cfg = ServerConfig {
-        model_path: cfg.model_path.clone(),
-        tools_dir: cfg.tools_dir.clone(),
-        port: cfg.port,
-        parallel: 1,
-        per_slot_ctx: VISION_CTX,
-        ngl: cfg.ngl,
-        mmproj: Some(cfg.mmproj_path.clone()),
-    };
-    let (backend, server) = start_with_fallback(&cfg.backend_prefs, &server_cfg)
-        .map_err(|e| format!("could not start the video model: {e}"))?;
-    log::info!(
-        "[VLM] video model up on {backend:?}; {count} frames sampled from {}",
-        path.display()
-    );
-
-    // 3. Ask, parse. Deliberately omit the filename: the goal is to describe
-    // opaquely-named videos from their frames, and including the name makes a
-    // small model echo it instead of describing what it sees.
-    let user = format!(
-        "Here is a montage of {count} frames sampled evenly from one video. \
-         Describe what the video most likely contains, based only on the frames."
-    );
-    let body = super::client::build_image_request(VISION_SYSTEM, &user, &png, guess_schema(), 256);
-    let raw = super::client::chat(server.endpoint(), &body)?;
-    parse_video_guess(&raw)
 }
 
 #[cfg(test)]
@@ -187,5 +225,15 @@ mod tests {
         let s = guess_schema().to_string();
         assert!(s.contains("Screen recording"));
         assert!(s.contains("Game capture"));
+    }
+
+    #[test]
+    fn detects_video_paths() {
+        assert!(is_video_path(Path::new("C:/x/DSC_1.MP4")));
+        assert!(is_video_path(Path::new("/a/b/clip.mkv")));
+        assert!(is_video_path(Path::new("movie.webm")));
+        assert!(!is_video_path(Path::new("notes.txt")));
+        assert!(!is_video_path(Path::new("C:/dir/no_ext")));
+        assert!(!is_video_path(Path::new("song.mp3")));
     }
 }

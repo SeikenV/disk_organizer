@@ -1,19 +1,18 @@
-# predict_videos.ps1 — pull every video out of a disk_organizer enrichment
-# result and predict its content with the SmolVLM2 vision model.
+# predict_videos.ps1 — predict the content of every video in a disk_organizer
+# enrichment result, then merge the vision guess next to the text classification.
 #
-# Takes the JSON item array the engine prints (text-enrichment result), keeps
-# the video files, and runs `--describe-video` on each, merging the vision
-# guess (summary/category/confidence) next to the text classification.
-#
-# Each video spins up its own llama-server (model reload per file) — fine for a
-# test/validation harness; slow for large batches.
+# The engine does the heavy lifting in ONE process: `--describe-videos-from`
+# filters the video files out of the item JSON and describes them all against a
+# single llama-server (one model load), printing a JSON array of guesses. This
+# script just runs that, joins each guess back to its text fields by path, and
+# writes a combined report.
 #
 # Usage:
 #   # 1. Produce an enrichment result (stdout is the item JSON array):
 #   target\release\disk_organizer.exe C --llm --backend cpu > result.json
 #   # 2. Predict the videos found in it:
 #   ./scripts/predict_videos.ps1 -Results result.json
-#   ./scripts/predict_videos.ps1 -Results result.json -Backend cpu -ExtraArgs '--vlm-model-path','tools/models/SmolVLM2-2.2B-...gguf'
+#   ./scripts/predict_videos.ps1 -Results result.json -ExtraArgs '--vlm-model-path','tools/models/SmolVLM2-2.2B-...gguf'
 
 [CmdletBinding()]
 param(
@@ -34,51 +33,37 @@ if (-not (Test-Path $exe)) {
 }
 if (-not (Test-Path $Results)) { throw "results file not found: $Results" }
 
-$videoExt = @('.mp4','.mkv','.mov','.avi','.webm','.m4v','.flv','.wmv','.mpg','.mpeg','.ts','.m2ts')
-$items = Get-Content $Results -Raw | ConvertFrom-Json
-$videos = @($items | Where-Object {
-    -not $_.is_dir -and ($videoExt -contains ([IO.Path]::GetExtension([string]$_.path)).ToLower())
-})
+# Text classification per path (for the join).
+$textByPath = @{}
+foreach ($it in (Get-Content $Results -Raw | ConvertFrom-Json)) {
+    $textByPath[[string]$it.path] = $it
+}
 
-if ($videos.Count -eq 0) {
+# One engine call: describe every video in the result against one llama-server.
+Write-Host "Predicting video contents (backend=$Backend, one shared server) ..." -ForegroundColor Cyan
+$visionJson = & $exe --describe-videos-from $Results --backend $Backend @ExtraArgs 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $visionJson) {
+    throw "describe-videos-from failed (exit $LASTEXITCODE)"
+}
+$vision = @(($visionJson | Out-String) | ConvertFrom-Json)
+if ($vision.Count -eq 0) {
     Write-Host "No video files found in $Results." -ForegroundColor Yellow
     return
 }
-Write-Host "Found $($videos.Count) video file(s). Predicting content (backend=$Backend) ..." -ForegroundColor Cyan
 
-$report = @()
-$i = 0
-foreach ($v in $videos) {
-    $i++
-    $path = [string]$v.path
-    $sizeMB = if ($v.physical_size) { [math]::Round($v.physical_size / 1MB, 1) } else { 0 }
-    Write-Host ("[{0}/{1}] {2} ({3} MB)" -f $i, $videos.Count, $path, $sizeMB) -ForegroundColor Gray
-
-    $entry = [ordered]@{
-        path          = $path
-        size_mb       = $sizeMB
-        text_category = $v.category
-        text_risk     = $v.risk
+# Merge vision guess with the text classification by path.
+$report = foreach ($g in $vision) {
+    $t = $textByPath[[string]$g.path]
+    [pscustomobject][ordered]@{
+        path              = $g.path
+        size_mb           = if ($t -and $t.physical_size) { [math]::Round($t.physical_size / 1MB, 1) } else { $null }
+        text_category     = if ($t) { $t.category } else { $null }
+        text_risk         = if ($t) { $t.risk } else { $null }
+        vision_summary    = $g.summary
+        vision_category   = $g.category
+        vision_confidence = $g.confidence
+        error             = $g.error
     }
-    if (-not (Test-Path $path)) {
-        $entry.error = "file no longer exists"
-        $report += [pscustomobject]$entry
-        continue
-    }
-    try {
-        $json = & $exe --describe-video $path --backend $Backend @ExtraArgs 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $json) {
-            $entry.error = "describe-video failed (exit $LASTEXITCODE)"
-        } else {
-            $guess = ($json | Out-String) | ConvertFrom-Json
-            $entry.vision_summary    = $guess.summary
-            $entry.vision_category   = $guess.category
-            $entry.vision_confidence = $guess.confidence
-        }
-    } catch {
-        $entry.error = $_.Exception.Message
-    }
-    $report += [pscustomobject]$entry
 }
 
 if (-not $Out) {
@@ -87,6 +72,6 @@ if (-not $Out) {
 $report | ConvertTo-Json -Depth 5 | Set-Content -Path $Out -Encoding UTF8
 
 Write-Host ""
-Write-Host "=== Video content predictions ===" -ForegroundColor Cyan
+Write-Host "=== Video content predictions ($($report.Count)) ===" -ForegroundColor Cyan
 $report | Format-Table -AutoSize -Wrap path, size_mb, vision_category, vision_confidence, vision_summary
 Write-Host "Full report: $Out" -ForegroundColor Green

@@ -32,7 +32,7 @@ pub use lifecycle::health_check as is_ollama_running;
 pub use lifecycle::preload_model;
 pub use llm::summarize_report;
 pub use llm::{DirSummary, FinalReport, parse_risk};
-pub use video::{describe_video, Confidence, VideoCategory, VideoConfig, VideoContentGuess};
+pub use video::{is_video_path, Confidence, VideoCategory, VideoConfig, VideoContentGuess, VisionSession};
 
 // ---- Re-export centralized constants (convenience for intra-module use) ----
 use crate::consts::{
