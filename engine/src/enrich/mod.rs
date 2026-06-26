@@ -1,6 +1,7 @@
 ﻿mod backend;
 mod client;
 mod content;
+mod frames;
 mod lifecycle;
 mod llm;
 mod orchestrator;
