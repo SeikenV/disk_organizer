@@ -224,6 +224,15 @@ fn main() -> std::io::Result<()> {
     let t0 = Instant::now();
     let index = build_index(records);
     let totals = aggregate(&index);
+    let used = totals
+        .get(&disk_organizer::model::ROOT_FRN)
+        .map(|a| (a.physical_size, a.file_count))
+        .unwrap_or((0, 0));
+    info!(
+        "Total accounted (hardlink-deduped): {} across {} files",
+        disk_organizer::format::human(used.0),
+        used.1
+    );
     let mut items = cut(&index, &totals, min);
     // Truncate by LLM-eligible count: items that need LLM analysis
     // (Source::Unknown dirs + Source::Heuristic files) count toward `top`;
