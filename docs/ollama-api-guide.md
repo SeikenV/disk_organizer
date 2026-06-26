@@ -1,11 +1,13 @@
 # Ollama API 官方使用指南
 
-> 本文总结自 [Ollama 官方文档](https://docs.ollama.com)，作为本项目调用 LLM 的唯一权威参考。
-> 所有 API 调用、参数使用、模型能力都以此文档为准。
+> ⚠️ **已废弃（历史记录）**：本项目**已不再使用 Ollama**。子项目 A 将后端统一到自管理的
+> llama.cpp `llama-server`（OpenAI 兼容 API），并移除了 `ollama-rs` 依赖。本文仅作早期实现的历史留存。
+> **当前的推理后端与调用方式见 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) §2、§5**，
+> 客户端实现见 `engine/src/enrich/client.rs`。
 >
-> **本项目实现**：底层使用社区维护的 Rust 客户端库
-> [`ollama-rs`](https://github.com/pepperoni21/ollama-rs) (v0.3.4, ⭐1000+, 347k downloads)。
-> 源代码位于 `src/enrich/llm.rs`。
+> ---
+>
+> 本文总结自 [Ollama 官方文档](https://docs.ollama.com)。（以下为历史内容。）
 
 ---
 

@@ -1,5 +1,10 @@
 # disk_organizer — 实现流程文档（Implementation Flow）
 
+> ⚠️ **已被取代（历史记录）**：本文是 2026-06-08 的开发前设计稿，多处与现状不符
+> （jwalk→MFT；Ollama 串行→自管理 llama.cpp 多槽位；§8 的 ollama/qwen2.5 配置块已被 CLI 参数取代；
+> §9 目录结构已变为 `engine/` workspace）。**当前权威流程见 [`docs/ARCHITECTURE.md`](../../ARCHITECTURE.md) §4**。
+> 本文仅作历史留存。
+>
 > 版本：2026-06-08 · 状态：设计稿待评审 · 配套：功能文档、架构文档
 
 ## 1. 运行时端到端流程

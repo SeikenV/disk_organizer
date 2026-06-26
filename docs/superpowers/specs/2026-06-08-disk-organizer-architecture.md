@@ -1,5 +1,10 @@
 # disk_organizer — 架构文档（Architecture）
 
+> ⚠️ **已被取代（历史记录）**：本文是 2026-06-08 的**开发前设计稿**，多处与现状不符
+> （已改用 NTFS MFT 而非 jwalk、自管理 llama.cpp 而非 Ollama、Qwen3.5-0.8B/SmolVLM2-500M
+> 而非 Qwen2.5 系、模块名为 `engine/src/{scan,classify,enrich,...}` 而非 C1–C9）。
+> **当前权威架构见 [`docs/ARCHITECTURE.md`](../../ARCHITECTURE.md)**。本文仅作设计演进的历史留存。
+>
 > 版本：2026-06-08 · 状态：设计稿待评审 · 配套：功能文档、实现流程文档
 
 ## 1. 总览
