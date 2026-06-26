@@ -6,6 +6,7 @@ mod lifecycle;
 mod llm;
 mod orchestrator;
 mod server;
+mod video;
 
 use crate::scan::index::Index;
 use crate::model::{Item, Source};
