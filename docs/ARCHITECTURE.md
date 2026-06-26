@@ -182,6 +182,22 @@ struct Item {              // 呈现给用户、可勾选删除的单元；字�
 | M3 接入 | "大 + 无意义命名"视频触发、延后队列、并入 Item 风险映射 | ⏳ 延后（独立周期） |
 | M4 | GUI（复选框 + treemap），复用引擎 | ⏳ 后续（`ui/` 已预留） |
 
+## 8.5 语言选项与 Web 搜索接口（reserved）
+
+- **语言选项 `--language <code>`**：分类按原有（已调优的）提示词产出后，再跑一轮
+  **批量翻译**（每 ~10 个 item 一次 LLM 调用，校验数量，失败回退逐项/保留原文）把每个
+  item 的 `category`/`purpose` 译成目标语言；最终报告直接用目标语言生成。不设则保持模型
+  默认语言。译文是展示层转换，**不改变 risk**。
+  ⚠️ **模型能力限制**：需要较强的文本模型（`--llm-model-path`）。默认的 Qwen3.5-0.8B
+  在中文内容上会忽略目标语言、直接输出中文（实测对 `--language en` 几乎无效）；该选项的
+  管道/回退已就绪，质量受模型大小限制（同 VLM 的 2.2B 建议）。
+- **Web 搜索接口（预留，GUI 之后再实现）**：`--web-search` 旗标已占位（当前为 no-op，
+  仅告警）。未来实现的接入点在 `summarize_dir`/`summarize_file` 组装提示词处，与
+  `ancestor_context`/`content_summary` 并列注入一段"厂商/产品"外部上下文。约束：
+  本项目是 **cost-free-first**（非 privacy-first），但外部上下文只能作为**不可信提示**
+  影响 `purpose`，**绝不参与 risk 判定**（与 LLM 同一红线）；且只针对 Program Files/
+  厂商目录的未知项，避免把噪声喂给小模型造成更差的"自信误判"。
+
 ## 9. 配置（现状：CLI 参数，无配置文件）
 
 原设计的 `llm.endpoint/text_model/...` 配置块已被 CLI 参数取代，例如：
@@ -191,6 +207,7 @@ struct Item {              // 呈现给用户、可勾选删除的单元；字�
 - 视频：`--describe-video <path>`（可重复）、`--describe-videos-from <json>`、`--vlm-model-path`、
   `--vlm-mmproj-path`、`--ffmpeg-dir`、`--vlm-port`、`--vlm-frame-rate`、`--vlm-min-frames`、
   `--vlm-max-frames`、`--vlm-downscale`（0=关闭，默认 512px）
+- 语言/预留：`--language <code>`（第二轮翻译，见 §8.5）、`--web-search`（预留 no-op）
 - 删除：移入回收站（默认）
 ```
 # 拉取工具（CPU + 文本模型）；加 -Video 拉 ffmpeg + 视觉模型

@@ -54,6 +54,15 @@ struct Args {
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
+    /// Translate results into this language via a second LLM pass (e.g. en, zh, ja).
+    /// Omit to keep the model's default output language. NOTE: needs a capable
+    /// text model (--llm-model-path); the small default (Qwen3.5-0.8B) tends to
+    /// ignore the target language and is not reliable for translation.
+    #[arg(long)]
+    language: Option<String>,
+    /// (Reserved — not yet implemented) Augment analysis with web search.
+    #[arg(long)]
+    web_search: bool,
     /// Look inside a video and describe what it probably contains, then exit.
     /// Repeatable; all videos share one llama-server.
     #[arg(long)]
@@ -99,6 +108,13 @@ struct Args {
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
     init_logger(args.debug)?;
+
+    // Reserved seam: --web-search is claimed for a future module that fetches
+    // vendor/product context to feed the LLM (see docs/ARCHITECTURE.md). It is
+    // intentionally a no-op until after the GUI milestone.
+    if args.web_search {
+        warn!("--web-search is reserved and not yet implemented; ignoring.");
+    }
 
     // Diagnostic short-circuit: measure where on-disk size lives.
     if args.size_audit {
@@ -282,6 +298,7 @@ fn main() -> std::io::Result<()> {
             ngl: args.llm_ngl,
             port: args.llm_port,
             sample_count: args.llm_samples,
+            language: args.language.clone(),
         };
         // enrich_items owns the llama-server lifecycle: it starts the backend
         // (with CUDA→Vulkan→CPU fallback), enriches, and shuts it down. If no

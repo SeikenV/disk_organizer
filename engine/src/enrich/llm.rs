@@ -140,6 +140,94 @@ pub fn summarize_file(
     parse_summary(&raw)
 }
 
+// ---- Second-round translation (language option) ----
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+struct TranslationBatchSchema {
+    items: Vec<TranslationItemSchema>,
+}
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+struct TranslationItemSchema {
+    category: String,
+    purpose: String,
+}
+
+#[derive(Deserialize)]
+struct TranslationBatchOut {
+    items: Vec<TranslationItemOut>,
+}
+#[derive(Deserialize)]
+struct TranslationItemOut {
+    category: String,
+    purpose: String,
+}
+
+fn translation_schema() -> Value {
+    serde_json::to_value(schemars::schema_for!(TranslationBatchSchema))
+        .expect("TranslationBatchSchema serializes")
+}
+
+/// Translate a batch of (category, purpose) pairs into `language` in ONE call.
+/// Returns Err if the model's item count doesn't match the input (so the caller
+/// can fall back to per-item translation or keep the originals).
+pub fn translate_batch(
+    endpoint: &str,
+    pairs: &[(String, String)],
+    language: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input = serde_json::to_string(
+        &pairs
+            .iter()
+            .map(|(c, p)| serde_json::json!({"category": c, "purpose": p}))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| e.to_string())?;
+    let system = format!(
+        "You are a professional translator. Rewrite each item's 'category' and 'purpose' fields \
+         ENTIRELY in {language}. You MUST output {language} only — never copy the source words, \
+         and never leave any text in the original language. Preserve meaning and technical terms \
+         (proper nouns like product names may stay). Return a JSON object {{\"items\": [...]}} with \
+         EXACTLY the same number of items, in the same order."
+    );
+    let user = format!(
+        "Translate every category and purpose below into {language}:\n{input}"
+    );
+    let max_tokens = ((pairs.len() as u32) * 90).clamp(256, 1500);
+    let body = crate::enrich::client::build_json_body(&system, &user, translation_schema(), max_tokens);
+    let raw = crate::enrich::client::chat(endpoint, &body)?;
+    parse_translation(&raw, pairs.len())
+}
+
+/// Parse a translation batch, requiring exactly `expected` items.
+fn parse_translation(raw: &str, expected: usize) -> Result<Vec<(String, String)>, String> {
+    let trimmed = raw.trim();
+    let try_parse = |s: &str| serde_json::from_str::<TranslationBatchOut>(s).ok();
+    let out = try_parse(trimmed)
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
+            try_parse(&trimmed[start..=end])
+        })
+        .ok_or_else(|| format!("translation: no valid JSON.\nRaw:\n{raw}"))?;
+    if out.items.len() != expected {
+        return Err(format!(
+            "translation count mismatch: got {}, expected {}",
+            out.items.len(),
+            expected
+        ));
+    }
+    Ok(out
+        .items
+        .into_iter()
+        .map(|i| (i.category, i.purpose))
+        .collect())
+}
+
 /// Ask the LLM for a holistic summary and cleanup plan.
 pub fn summarize_report(
     endpoint: &str,
@@ -157,6 +245,7 @@ pub fn summarize_report(
     caution_total: usize,
     system_total: usize,
     unknown_total: usize,
+    language: Option<&str>,
 ) -> Result<FinalReport, String> {
     fn fmt_group(
         label: &str,
@@ -200,8 +289,16 @@ pub fn summarize_report(
     // in `content` (no reasoning phase to drain into `thinking`).  Output is
     // capped at 1024 tokens — enough for overview + summaries + cleanup plan
     // while leaving headroom in a 4096-token slot.
+    let mut system = system_prompt_report();
+    match language.filter(|l| !l.is_empty()) {
+        Some(lang) => system.push_str(&format!(
+            "\n\nIMPORTANT: Write every field ENTIRELY in {lang}. Do not use any other language."
+        )),
+        // Preserve prior behavior when no language is requested.
+        None => system.push_str("\n\nUse Chinese if the paths suggest a Chinese user, otherwise English."),
+    }
     let body = crate::enrich::client::build_json_body(
-        &system_prompt_report(),
+        &system,
         &user_prompt,
         report_schema(),
         1024,
@@ -397,7 +494,6 @@ fn system_prompt_report() -> String {
     "\
 You are a disk cleanup advisor. Given categorized scan data, produce a cleanup plan.
 Output ONLY the JSON object with fields: overview, safe_summary, caution_advice, cleanup_plan.
-Use Chinese if the paths suggest a Chinese user.
 
 IMPORTANT: safe_summary must ONLY describe SAFE items (things that can be deleted).
 caution_advice must ONLY describe CAUTION items (things that need review).
@@ -505,6 +601,26 @@ mod tests {
     #[test]
     fn parse_garbled_fails() {
         assert!(parse_summary("not json at all").is_err());
+    }
+
+    #[test]
+    fn translation_parses_and_validates_count() {
+        let raw = r#"{"items":[{"category":"Cache","purpose":"safe to delete"},{"category":"Logs","purpose":"app logs"}]}"#;
+        let out = parse_translation(raw, 2).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "Cache");
+        assert_eq!(out[1].1, "app logs");
+    }
+
+    #[test]
+    fn translation_count_mismatch_errors() {
+        let raw = r#"{"items":[{"category":"Cache","purpose":"x"}]}"#;
+        assert!(parse_translation(raw, 3).is_err());
+    }
+
+    #[test]
+    fn translation_garbage_errors() {
+        assert!(parse_translation("not json", 1).is_err());
     }
 
     #[test]

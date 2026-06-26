@@ -65,6 +65,9 @@ pub struct LlmConfig {
     pub port: u16,
     /// How many child filenames to sample per directory.
     pub sample_count: usize,
+    /// Optional target language: when set, a second LLM pass translates each
+    /// item's category/purpose (and the report) into it. None = no translation.
+    pub language: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -78,6 +81,7 @@ impl Default for LlmConfig {
             ngl: 999,
             port: 8080,
             sample_count: 20,
+            language: None,
         }
     }
 }
@@ -352,6 +356,47 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
         items[*idx].source = Source::LLM;
     }
 
+    // ---- Optional second-round translation into the user's language ----
+    // Translate every item's category/purpose in batches; on a batch failure
+    // (bad JSON / count mismatch) fall back per-item and keep originals on error.
+    if let Some(lang) = config.language.as_deref().filter(|l| !l.is_empty()) {
+        const TRANSLATE_CHUNK: usize = 10;
+        info!("[LLM] Translating {} items into {lang} ...", items.len());
+        let mut done = 0usize;
+        let mut start = 0usize;
+        while start < items.len() {
+            let end = (start + TRANSLATE_CHUNK).min(items.len());
+            let pairs: Vec<(String, String)> = items[start..end]
+                .iter()
+                .map(|it| (it.category.clone(), it.purpose.clone()))
+                .collect();
+            match llm::translate_batch(&endpoint, &pairs, lang) {
+                Ok(tr) => {
+                    for (it, (c, p)) in items[start..end].iter_mut().zip(tr) {
+                        it.category = c;
+                        it.purpose = p;
+                        done += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!("[LLM] batch translation failed ({e}); retrying per-item");
+                    for it in items[start..end].iter_mut() {
+                        let one = [(it.category.clone(), it.purpose.clone())];
+                        if let Ok(mut tr) = llm::translate_batch(&endpoint, &one, lang) {
+                            if let Some((c, p)) = tr.pop() {
+                                it.category = c;
+                                it.purpose = p;
+                                done += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            start = end;
+        }
+        info!("[LLM] Translated {done}/{} items into {lang}.", items.len());
+    }
+
     let ok = results.len();
     let fail = failures.len();
     let avg_ms = if ok > 0 { elapsed.as_millis() as f64 / ok as f64 } else { 0.0 };
@@ -549,6 +594,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                 caution_total,
                 system_total,
                 unknown_total,
+                config.language.as_deref(),
             );
             if let Err(ref e) = report_result {
                 warn!("[LLM] Final report attempt {attempt} failed: {e}");
