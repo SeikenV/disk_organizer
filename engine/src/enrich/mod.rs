@@ -361,40 +361,49 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     // (bad JSON / count mismatch) fall back per-item and keep originals on error.
     if let Some(lang) = config.language.as_deref().filter(|l| !l.is_empty()) {
         const TRANSLATE_CHUNK: usize = 10;
-        info!("[LLM] Translating {} items into {lang} ...", items.len());
+        let lang_name = llm::language_name(lang);
+        // Only translate items whose text isn't already in the target script, so
+        // we never flip already-correct labels (e.g. English catalog purposes).
+        let todo: Vec<usize> = (0..items.len())
+            .filter(|&i| {
+                llm::needs_translation(&format!("{} {}", items[i].category, items[i].purpose), lang)
+            })
+            .collect();
+        info!(
+            "[LLM] Translating {} of {} items into {lang_name} ...",
+            todo.len(),
+            items.len()
+        );
         let mut done = 0usize;
-        let mut start = 0usize;
-        while start < items.len() {
-            let end = (start + TRANSLATE_CHUNK).min(items.len());
-            let pairs: Vec<(String, String)> = items[start..end]
+        for chunk in todo.chunks(TRANSLATE_CHUNK) {
+            let pairs: Vec<(String, String)> = chunk
                 .iter()
-                .map(|it| (it.category.clone(), it.purpose.clone()))
+                .map(|&i| (items[i].category.clone(), items[i].purpose.clone()))
                 .collect();
             match llm::translate_batch(&endpoint, &pairs, lang) {
                 Ok(tr) => {
-                    for (it, (c, p)) in items[start..end].iter_mut().zip(tr) {
-                        it.category = c;
-                        it.purpose = p;
+                    for (&i, (c, p)) in chunk.iter().zip(tr) {
+                        items[i].category = c;
+                        items[i].purpose = p;
                         done += 1;
                     }
                 }
                 Err(e) => {
                     warn!("[LLM] batch translation failed ({e}); retrying per-item");
-                    for it in items[start..end].iter_mut() {
-                        let one = [(it.category.clone(), it.purpose.clone())];
+                    for &i in chunk {
+                        let one = [(items[i].category.clone(), items[i].purpose.clone())];
                         if let Ok(mut tr) = llm::translate_batch(&endpoint, &one, lang) {
                             if let Some((c, p)) = tr.pop() {
-                                it.category = c;
-                                it.purpose = p;
+                                items[i].category = c;
+                                items[i].purpose = p;
                                 done += 1;
                             }
                         }
                     }
                 }
             }
-            start = end;
         }
-        info!("[LLM] Translated {done}/{} items into {lang}.", items.len());
+        info!("[LLM] Translated {done}/{} items into {lang_name}.", todo.len());
     }
 
     let ok = results.len();

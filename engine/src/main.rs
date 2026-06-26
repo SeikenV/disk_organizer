@@ -54,10 +54,11 @@ struct Args {
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
-    /// Translate results into this language via a second LLM pass (e.g. en, zh, ja).
-    /// Omit to keep the model's default output language. NOTE: needs a capable
-    /// text model (--llm-model-path); the small default (Qwen3.5-0.8B) tends to
-    /// ignore the target language and is not reliable for translation.
+    /// Translate results into this language via a second LLM pass. Accepts a
+    /// full name or code (English, en, 日本語, ja, zh ...). Omit to keep the
+    /// model's default language. On the small default model (Qwen3.5-0.8B) a
+    /// minority of items may keep the source language; a larger model via
+    /// --llm-model-path translates everything.
     #[arg(long)]
     language: Option<String>,
     /// (Reserved — not yet implemented) Augment analysis with web search.

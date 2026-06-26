@@ -169,6 +169,53 @@ fn translation_schema() -> Value {
         .expect("TranslationBatchSchema serializes")
 }
 
+/// Expand a language code to a full English language name the model is far more
+/// likely to recognize than an ISO code ("en" -> "English"). Unknown values
+/// (including a full name already) pass through unchanged.
+pub fn language_name(code: &str) -> String {
+    let name = match code.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" | "english" => "English",
+        "zh" | "zh-cn" | "zh-hans" | "cn" | "chinese" => "Chinese",
+        "zh-tw" | "zh-hant" => "Traditional Chinese",
+        "ja" | "jp" | "japanese" => "Japanese",
+        "ko" | "kr" | "korean" => "Korean",
+        "fr" | "french" => "French",
+        "es" | "spanish" => "Spanish",
+        "de" | "german" => "German",
+        "ru" | "russian" => "Russian",
+        "pt" | "portuguese" => "Portuguese",
+        "it" | "italian" => "Italian",
+        _ => return code.trim().to_string(),
+    };
+    name.to_string()
+}
+
+/// True if `text` contains CJK (Chinese/Japanese/Korean) characters.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        (0x4E00..=0x9FFF).contains(&u)   // CJK Unified Ideographs
+            || (0x3040..=0x30FF).contains(&u) // Hiragana + Katakana
+            || (0xAC00..=0xD7AF).contains(&u) // Hangul syllables
+    })
+}
+
+/// Whether `text` plausibly still needs translating into `target`. Script-based
+/// heuristic for the dominant zh<->en case: don't re-translate text already in
+/// the target script (which on a small model risks flipping correct labels, e.g.
+/// an English catalog purpose getting rewritten back into Chinese).
+pub fn needs_translation(text: &str, target: &str) -> bool {
+    let target_cjk = matches!(
+        language_name(target).as_str(),
+        "Chinese" | "Traditional Chinese" | "Japanese" | "Korean"
+    );
+    if target_cjk {
+        !has_cjk(text) // latin/other text needs converting into a CJK target
+    } else {
+        has_cjk(text) // only CJK text needs converting into a latin target
+    }
+}
+
 /// Translate a batch of (category, purpose) pairs into `language` in ONE call.
 /// Returns Err if the model's item count doesn't match the input (so the caller
 /// can fall back to per-item translation or keep the originals).
@@ -187,15 +234,16 @@ pub fn translate_batch(
             .collect::<Vec<_>>(),
     )
     .map_err(|e| e.to_string())?;
+    let lang = language_name(language);
     let system = format!(
         "You are a professional translator. Rewrite each item's 'category' and 'purpose' fields \
-         ENTIRELY in {language}. You MUST output {language} only — never copy the source words, \
+         ENTIRELY in the {lang} language. You MUST output {lang} only — never copy the source words, \
          and never leave any text in the original language. Preserve meaning and technical terms \
          (proper nouns like product names may stay). Return a JSON object {{\"items\": [...]}} with \
          EXACTLY the same number of items, in the same order."
     );
     let user = format!(
-        "Translate every category and purpose below into {language}:\n{input}"
+        "Render every category and purpose below in the {lang} language:\n{input}"
     );
     let max_tokens = ((pairs.len() as u32) * 90).clamp(256, 1500);
     let body = crate::enrich::client::build_json_body(&system, &user, translation_schema(), max_tokens);
@@ -292,7 +340,8 @@ pub fn summarize_report(
     let mut system = system_prompt_report();
     match language.filter(|l| !l.is_empty()) {
         Some(lang) => system.push_str(&format!(
-            "\n\nIMPORTANT: Write every field ENTIRELY in {lang}. Do not use any other language."
+            "\n\nIMPORTANT: Write every field ENTIRELY in the {} language. Do not use any other language.",
+            language_name(lang)
         )),
         // Preserve prior behavior when no language is requested.
         None => system.push_str("\n\nUse Chinese if the paths suggest a Chinese user, otherwise English."),
@@ -621,6 +670,27 @@ mod tests {
     #[test]
     fn translation_garbage_errors() {
         assert!(parse_translation("not json", 1).is_err());
+    }
+
+    #[test]
+    fn language_codes_expand_to_full_names() {
+        assert_eq!(language_name("en"), "English");
+        assert_eq!(language_name("EN"), "English");
+        assert_eq!(language_name("ja"), "Japanese");
+        assert_eq!(language_name("zh"), "Chinese");
+        // Full names and unknowns pass through.
+        assert_eq!(language_name("English"), "English");
+        assert_eq!(language_name("Klingon"), "Klingon");
+    }
+
+    #[test]
+    fn needs_translation_is_script_aware() {
+        // Into English: only CJK text needs converting; already-latin is skipped.
+        assert!(needs_translation("虚拟内存", "en"));
+        assert!(!needs_translation("Virtual memory", "en"));
+        // Into Chinese: only latin text needs converting; already-CJK is skipped.
+        assert!(needs_translation("Virtual memory", "zh"));
+        assert!(!needs_translation("虚拟内存", "zh"));
     }
 
     #[test]
