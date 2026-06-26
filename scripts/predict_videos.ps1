@@ -7,16 +7,23 @@
 # script just runs that, joins each guess back to its text fields by path, and
 # writes a combined report.
 #
+# Parameters:
+#   -EnrichResult  INPUT  (required): path to an existing enrichment-result JSON
+#                  — the engine's item array. You produce this FIRST; the script
+#                  only READS it. (Alias: -Results.)
+#   -Out           OUTPUT (optional): report path the script CREATES. Defaults to
+#                  predictions_<timestamp>.json in the project root.
+#
 # Usage:
-#   # 1. Produce an enrichment result (stdout is the item JSON array):
-#   target\release\disk_organizer.exe C --llm --backend cpu > result.json
-#   # 2. Predict the videos found in it:
-#   ./scripts/predict_videos.ps1 -Results result.json
-#   ./scripts/predict_videos.ps1 -Results result.json -ExtraArgs '--vlm-model-path','tools/models/SmolVLM2-2.2B-...gguf'
+#   # 1. Produce the enrichment result (the engine writes this file):
+#   target\release\disk_organizer.exe C --llm --backend cpu | Out-File -Encoding utf8 result.json
+#   # 2. Predict the videos found IN that file:
+#   ./scripts/predict_videos.ps1 -EnrichResult result.json
+#   ./scripts/predict_videos.ps1 -EnrichResult result.json -ExtraArgs '--vlm-model-path','tools/models/SmolVLM2-2.2B-...gguf'
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string]$Results,
+    [Parameter(Mandatory)] [Alias('Results')] [string]$EnrichResult,
     [string]$Backend = "cpu",
     [string]$Out,
     [string[]]$ExtraArgs = @()
@@ -31,17 +38,17 @@ if (-not (Test-Path $exe)) {
     Write-Host "Building release binary ..." -ForegroundColor Yellow
     & cargo build -p disk_organizer --release
 }
-if (-not (Test-Path $Results)) { throw "results file not found: $Results" }
+if (-not (Test-Path $EnrichResult)) { throw "input enrichment-result file not found: $EnrichResult (you must generate it first; see script header)" }
 
 # Text classification per path (for the join).
 $textByPath = @{}
-foreach ($it in (Get-Content $Results -Raw | ConvertFrom-Json)) {
+foreach ($it in (Get-Content $EnrichResult -Raw | ConvertFrom-Json)) {
     $textByPath[[string]$it.path] = $it
 }
 
 # One engine call: describe every video in the result against one llama-server.
 Write-Host "Predicting video contents (backend=$Backend, one shared server) ..." -ForegroundColor Cyan
-$visionJson = & $exe --describe-videos-from $Results --backend $Backend @ExtraArgs 2>$null
+$visionJson = & $exe --describe-videos-from $EnrichResult --backend $Backend @ExtraArgs 2>$null
 if ($LASTEXITCODE -ne 0 -or -not $visionJson) {
     throw "describe-videos-from failed (exit $LASTEXITCODE)"
 }
