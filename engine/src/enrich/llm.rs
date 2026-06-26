@@ -223,6 +223,10 @@ content summary, and sample child names, classify it and describe its purpose.
 Output valid JSON matching the schema: {"category": "...", "purpose": "...", "risk": "..."}.
 Use Chinese for labels.
 
+对用户目录（Downloads/Videos/Desktop/Documents 及个人项目目录），目录名本身意义不大；
+当 Content summary 列出 "largest files:" 时，purpose 必须点出其中最占空间的具体大文件
+（文件名 + 大小），帮助用户判断这些大文件是否要清理，而不是只复述目录用途。
+
 IMPORTANT: Do NOT assume every CAUTION item is "game data" or "Steam". Consider
 the full variety of reasons a directory may require review: drivers, professional
 software, old projects, hardware utilities, SDK toolchains, installers.

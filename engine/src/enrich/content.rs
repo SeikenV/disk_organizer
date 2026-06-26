@@ -28,6 +28,7 @@ pub fn summarize_children(frn: u64, index: &Index) -> String {
     let mut dirs: Vec<String> = Vec::new();
     let mut dir_frns: Vec<u64> = Vec::new(); // parallel to dirs, for O(1) child count lookup
     let mut exts: HashMap<String, (u64, usize)> = HashMap::new(); // total_size, count
+    let mut files: Vec<(String, u64)> = Vec::new(); // (name, size) for largest-file callouts
 
     for &child_frn in children {
         let rec = match index.by_frn.get(&child_frn) {
@@ -42,6 +43,7 @@ pub fn summarize_children(frn: u64, index: &Index) -> String {
             let e = exts.entry(ext).or_default();
             e.0 += rec.physical_size;
             e.1 += 1;
+            files.push((rec.name.clone(), rec.physical_size));
         }
     }
 
@@ -71,6 +73,23 @@ pub fn summarize_children(frn: u64, index: &Index) -> String {
             .map(|(ext, (_, cnt))| format!(".{ext}(×{cnt})"))
             .collect();
         parts.push(ext_parts.join(", "));
+    }
+
+    // Largest individual files by size (name + size) — so the directory summary
+    // cites the big files actually taking space, not just an extension tally.
+    // Only callouts ≥ ~50 MB, which is what matters for a disk-bloat analysis.
+    if !files.is_empty() {
+        files.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+        const MIN_CALLOUT: u64 = 50 * 1024 * 1024;
+        let big: Vec<String> = files
+            .iter()
+            .take(3)
+            .filter(|(_, s)| *s >= MIN_CALLOUT)
+            .map(|(name, s)| format!("{name} ({})", crate::format::human(*s)))
+            .collect();
+        if !big.is_empty() {
+            parts.push(format!("largest files: {}", big.join(", ")));
+        }
     }
 
     // Subdirectory count + largest (uses pre-collected FRNs for O(1) lookups).
@@ -162,6 +181,24 @@ mod tests {
         assert!(summary.contains(".zip"));
         assert!(summary.contains(".exe"));
         assert!(summary.contains("old_backup"));
+    }
+
+    #[test]
+    fn cites_largest_files_with_sizes() {
+        let mb = 1024 * 1024;
+        let records = vec![
+            dir(10, 5, "Downloads"),
+            file(20, 10, "movie.mkv", 8500 * mb),
+            file(21, 10, "clip.mp4", 1200 * mb),
+            file(22, 10, "small.txt", 10), // below the 50 MB callout threshold
+        ];
+        let index = build_index(records);
+        let summary = summarize_children(10, &index);
+        assert!(summary.contains("largest files:"), "summary: {summary}");
+        assert!(summary.contains("movie.mkv"));
+        assert!(summary.contains("GB"));
+        // The tiny file is below the callout threshold and must not be named.
+        assert!(!summary.contains("small.txt"), "summary: {summary}");
     }
 
     #[test]
