@@ -255,9 +255,9 @@ pub fn size_audit(mft_bytes: Vec<u8>) {
 
     eprintln!("\n===== MFT SIZE AUDIT v2 =====");
     eprintln!("files (base, non-dir)                  : {n_files}");
-    eprintln!("unnamed $DATA alloc, BASE records      : {:.1} GB  (= current scan)", gb(base_unnamed));
-    eprintln!("unnamed $DATA alloc, EXTENSION records : {:.1} GB  (currently SKIPPED)", gb(ext_unnamed));
-    eprintln!("unnamed $DATA alloc, ALL records       : {:.1} GB  (<- compare to OS used)", gb(base_unnamed + ext_unnamed));
+    eprintln!("unnamed $DATA alloc, BASE records      : {:.1} GB  (base FILE records only)", gb(base_unnamed));
+    eprintln!("unnamed $DATA alloc, EXTENSION records : {:.1} GB  (now INCLUDED: summed onto base FRN by parse_records)", gb(ext_unnamed));
+    eprintln!("unnamed $DATA alloc, ALL records       : {:.1} GB  (<- the scan's flat $DATA total; compare to OS used)", gb(base_unnamed + ext_unnamed));
     eprintln!("Sum $FILE_NAME allocated_size          : {:.1} GB", gb(fn_phys));
     eprintln!("files with $ATTRIBUTE_LIST             : {attrlist_files}");
     eprintln!("--- 'allocated_length==0 & file_size>0' group ---");
