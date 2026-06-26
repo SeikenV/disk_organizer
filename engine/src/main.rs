@@ -55,10 +55,10 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
     /// Translate results into this language via a second LLM pass. Accepts a
-    /// full name or code (English, en, 日本語, ja, zh ...). Omit to keep the
-    /// model's default language. On the small default model (Qwen3.5-0.8B) a
-    /// minority of items may keep the source language; a larger model via
-    /// --llm-model-path translates everything.
+    /// full name or code (English, en, ja, zh ...). Omit to keep the model's
+    /// default language. Works on the small default model via phrasing-rotation
+    /// retries on stragglers (slower); a larger model (--llm-model-path) is
+    /// faster and needs fewer retries.
     #[arg(long)]
     language: Option<String>,
     /// (Reserved — not yet implemented) Augment analysis with web search.

@@ -362,42 +362,52 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     if let Some(lang) = config.language.as_deref().filter(|l| !l.is_empty()) {
         const TRANSLATE_CHUNK: usize = 10;
         let lang_name = llm::language_name(lang);
+        let still_source = |it: &Item| {
+            llm::needs_translation(&format!("{} {}", it.category, it.purpose), lang)
+        };
         // Only translate items whose text isn't already in the target script, so
         // we never flip already-correct labels (e.g. English catalog purposes).
-        let todo: Vec<usize> = (0..items.len())
-            .filter(|&i| {
-                llm::needs_translation(&format!("{} {}", items[i].category, items[i].purpose), lang)
-            })
+        let todo: Vec<usize> = (0..items.len()).filter(|&i| still_source(&items[i])).collect();
+        // Snapshot originals so straggler retries translate from the source text,
+        // not from a bad first-pass result.
+        let orig: std::collections::HashMap<usize, (String, String)> = todo
+            .iter()
+            .map(|&i| (i, (items[i].category.clone(), items[i].purpose.clone())))
             .collect();
         info!(
             "[LLM] Translating {} of {} items into {lang_name} ...",
             todo.len(),
             items.len()
         );
-        let mut done = 0usize;
+
+        // Pass 1: fast batched translation with the first phrasing.
         for chunk in todo.chunks(TRANSLATE_CHUNK) {
-            let pairs: Vec<(String, String)> = chunk
-                .iter()
-                .map(|&i| (items[i].category.clone(), items[i].purpose.clone()))
-                .collect();
-            match llm::translate_batch(&endpoint, &pairs, lang) {
-                Ok(tr) => {
-                    for (&i, (c, p)) in chunk.iter().zip(tr) {
-                        items[i].category = c;
-                        items[i].purpose = p;
-                        done += 1;
-                    }
+            let pairs: Vec<(String, String)> = chunk.iter().map(|&i| orig[&i].clone()).collect();
+            if let Ok(tr) = llm::translate_batch(&endpoint, &pairs, lang, 0) {
+                for (&i, (c, p)) in chunk.iter().zip(tr) {
+                    items[i].category = c;
+                    items[i].purpose = p;
                 }
-                Err(e) => {
-                    warn!("[LLM] batch translation failed ({e}); retrying per-item");
-                    for &i in chunk {
-                        let one = [(items[i].category.clone(), items[i].purpose.clone())];
-                        if let Ok(mut tr) = llm::translate_batch(&endpoint, &one, lang) {
-                            if let Some((c, p)) = tr.pop() {
-                                items[i].category = c;
-                                items[i].purpose = p;
-                                done += 1;
-                            }
+            }
+        }
+
+        // Pass 2: anything still in the source script (batch error OR a "success"
+        // that stayed in the source language) → retry per-item, rotating phrasings.
+        let mut done = 0usize;
+        for &i in &todo {
+            if !still_source(&items[i]) {
+                done += 1;
+                continue;
+            }
+            let (oc, op) = &orig[&i];
+            for ph in 0..llm::phrasing_count() {
+                if let Ok(mut tr) = llm::translate_batch(&endpoint, &[(oc.clone(), op.clone())], lang, ph) {
+                    if let Some((c, p)) = tr.pop() {
+                        if !llm::needs_translation(&format!("{c} {p}"), lang) {
+                            items[i].category = c;
+                            items[i].purpose = p;
+                            done += 1;
+                            break;
                         }
                     }
                 }

@@ -216,13 +216,30 @@ pub fn needs_translation(text: &str, target: &str) -> bool {
     }
 }
 
-/// Translate a batch of (category, purpose) pairs into `language` in ONE call.
-/// Returns Err if the model's item count doesn't match the input (so the caller
-/// can fall back to per-item translation or keep the originals).
+/// Instruction phrasings, tried in rotation. Small models vary by verb, so a
+/// straggler one phrasing fails to translate often succeeds with another — we
+/// don't bet on a single hardcoded wording. `{lang}` is filled with the full
+/// language name.
+const TRANSLATE_PHRASINGS: [&str; 4] = [
+    "Translate the following items into the {lang} language",
+    "Transcribe the following items in the {lang} language",
+    "Reiterate the following items in the {lang} language",
+    "Rewrite each of the following items in the {lang} language",
+];
+
+/// How many phrasings are available (for the caller's straggler rotation).
+pub fn phrasing_count() -> usize {
+    TRANSLATE_PHRASINGS.len()
+}
+
+/// Translate a batch of (category, purpose) pairs into `language` in ONE call,
+/// using phrasing variant `phrasing` (rotated by the caller). Returns Err if the
+/// model's item count doesn't match the input, so the caller can retry/keep.
 pub fn translate_batch(
     endpoint: &str,
     pairs: &[(String, String)],
     language: &str,
+    phrasing: usize,
 ) -> Result<Vec<(String, String)>, String> {
     if pairs.is_empty() {
         return Ok(Vec::new());
@@ -235,6 +252,8 @@ pub fn translate_batch(
     )
     .map_err(|e| e.to_string())?;
     let lang = language_name(language);
+    let verb =
+        TRANSLATE_PHRASINGS[phrasing % TRANSLATE_PHRASINGS.len()].replace("{lang}", &lang);
     let system = format!(
         "You are a professional translator. Rewrite each item's 'category' and 'purpose' fields \
          ENTIRELY in the {lang} language. You MUST output {lang} only — never copy the source words, \
@@ -242,9 +261,7 @@ pub fn translate_batch(
          (proper nouns like product names may stay). Return a JSON object {{\"items\": [...]}} with \
          EXACTLY the same number of items, in the same order."
     );
-    let user = format!(
-        "Render every category and purpose below in the {lang} language:\n{input}"
-    );
+    let user = format!("{verb}:\n{input}");
     let max_tokens = ((pairs.len() as u32) * 90).clamp(256, 1500);
     let body = crate::enrich::client::build_json_body(&system, &user, translation_schema(), max_tokens);
     let raw = crate::enrich::client::chat(endpoint, &body)?;
