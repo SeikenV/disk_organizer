@@ -328,8 +328,10 @@ fn main() -> std::io::Result<()> {
 fn collect_videos(explicit: &[PathBuf], from: &Option<PathBuf>) -> std::io::Result<Vec<PathBuf>> {
     let mut videos: Vec<PathBuf> = explicit.to_vec();
     if let Some(path) = from {
-        let text = std::fs::read_to_string(path)?;
-        let items: Vec<Item> = serde_json::from_str(&text).map_err(|e| {
+        // Read leniently: PowerShell `>` / Out-File default to UTF-16 LE (with
+        // BOM) on Windows, so a redirected result.json isn't plain UTF-8.
+        let text = read_text_lenient(path)?;
+        let items: Vec<Item> = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("parsing {}: {e}", path.display()),
@@ -344,6 +346,41 @@ fn collect_videos(explicit: &[PathBuf], from: &Option<PathBuf>) -> std::io::Resu
     let mut seen = std::collections::HashSet::new();
     videos.retain(|p| seen.insert(p.clone()));
     Ok(videos)
+}
+
+/// Read a text file, decoding the common Windows encodings produced by shell
+/// redirection: UTF-8, UTF-8-with-BOM, and UTF-16 LE/BE (with BOM). PowerShell's
+/// `>` and `Out-File` default to UTF-16 LE, which plain `read_to_string` rejects.
+fn read_text_lenient(path: &std::path::Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, false)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+    }
+    // UTF-8 (BOM, if any, is stripped by the caller before JSON parsing).
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Decode raw bytes (BOM already stripped) as UTF-16 in the given endianness.
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err("odd-length UTF-16 stream".into());
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little_endian {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&units).map_err(|e| e.to_string())
 }
 
 /// Map repeatable `--backend` strings to a preference list, falling back to the
@@ -396,4 +433,46 @@ fn init_logger(debug: bool) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_utf16_little_and_big_endian() {
+        // "[]" in UTF-16, no BOM.
+        let le = [0x5B, 0x00, 0x5D, 0x00];
+        let be = [0x00, 0x5B, 0x00, 0x5D];
+        assert_eq!(decode_utf16(&le, true).unwrap(), "[]");
+        assert_eq!(decode_utf16(&be, false).unwrap(), "[]");
+    }
+
+    #[test]
+    fn decode_utf16_rejects_odd_length() {
+        assert!(decode_utf16(&[0x5B, 0x00, 0x5D], true).is_err());
+    }
+
+    #[test]
+    fn read_text_lenient_handles_encodings() {
+        let dir = std::env::temp_dir();
+        let content = "[\"ok\"]";
+
+        // UTF-8 (no BOM)
+        let p8 = dir.join("disk_org_test_utf8.json");
+        std::fs::write(&p8, content.as_bytes()).unwrap();
+        assert_eq!(read_text_lenient(&p8).unwrap(), content);
+
+        // UTF-16 LE with BOM (what PowerShell `>` writes)
+        let p16 = dir.join("disk_org_test_utf16le.json");
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in content.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&p16, &bytes).unwrap();
+        assert_eq!(read_text_lenient(&p16).unwrap(), content);
+
+        let _ = std::fs::remove_file(&p8);
+        let _ = std::fs::remove_file(&p16);
+    }
 }
