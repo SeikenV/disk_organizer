@@ -421,6 +421,18 @@ pub fn parse_risk(llm_risk: Option<&str>) -> crate::model::Risk {
     }
 }
 
+/// Zero-误删 redline: the LLM may guess a category/purpose, but it must NEVER
+/// mark an item "safe to delete" — only deterministic rules may declare Safe.
+/// A guessed Safe is demoted to Unknown (e.g. the model called a source repo
+/// containing a `target/` dir "safe"); conservative Caution/System guesses,
+/// which lean toward keeping, pass through unchanged.
+pub fn clamp_llm_risk(r: crate::model::Risk) -> crate::model::Risk {
+    match r {
+        crate::model::Risk::Safe => crate::model::Risk::Unknown,
+        other => other,
+    }
+}
+
 /// Parse DirSummary from JSON.  With `format` JSON Schema constraint,
 /// the model outputs clean JSON directly.  The extraction fallback handles
 /// rare cases where the model wraps JSON in surrounding text.
@@ -493,5 +505,16 @@ mod tests {
     #[test]
     fn parse_garbled_fails() {
         assert!(parse_summary("not json at all").is_err());
+    }
+
+    #[test]
+    fn llm_safe_is_demoted_to_unknown() {
+        use crate::model::Risk;
+        // The redline: a guessed Safe must never stick.
+        assert_eq!(clamp_llm_risk(Risk::Safe), Risk::Unknown);
+        // Conservative guesses pass through.
+        assert_eq!(clamp_llm_risk(Risk::Caution), Risk::Caution);
+        assert_eq!(clamp_llm_risk(Risk::System), Risk::System);
+        assert_eq!(clamp_llm_risk(Risk::Unknown), Risk::Unknown);
     }
 }

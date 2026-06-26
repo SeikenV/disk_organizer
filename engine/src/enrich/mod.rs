@@ -341,7 +341,10 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     for (idx, ref summary) in &results {
         items[*idx].category = summary.category.clone();
         items[*idx].purpose = summary.purpose.clone();
-        let llm_risk = llm::parse_risk(summary.risk.as_deref());
+        // Zero-误删 redline: a guessed Safe is demoted to Unknown — only rules
+        // may declare something safe to delete (the LLM has called source repos
+        // and installed software "safe").
+        let llm_risk = llm::clamp_llm_risk(llm::parse_risk(summary.risk.as_deref()));
         // Only override risk if it was Unknown — don't downgrade catalog risks.
         if items[*idx].risk == crate::model::Risk::Unknown {
             items[*idx].risk = llm_risk;

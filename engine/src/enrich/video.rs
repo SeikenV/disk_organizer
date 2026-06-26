@@ -95,9 +95,13 @@ fn tool_exe(dir: &Path, name: &str) -> PathBuf {
 
 const VISION_CTX: usize = 8192;
 const VISION_SYSTEM: &str = "You are a video content classifier. You are shown a \
-montage grid of frames sampled evenly from one video file. Guess what the video \
-most likely contains. This is a GUESS, not confirmation (推测，非确证). Reply ONLY \
-with JSON matching the schema: a one-sentence summary, a category, and confidence.";
+montage grid of frames sampled evenly from one video file. Describe what the \
+video most likely contains. This is a GUESS, not confirmation (推测，非确证). \
+Base your answer ONLY on what is visibly present in the frames — describe the \
+scenes, setting, people, and on-screen elements you actually see. Do NOT use \
+prior knowledge of any movie/show title, and do NOT invent plot, characters, \
+named entities, or content ratings. Reply ONLY with JSON matching the schema: \
+a one-sentence summary, a category, and confidence.";
 
 /// File extensions treated as video for `--describe-videos-from` filtering.
 const VIDEO_EXTS: &[&str] = &[
