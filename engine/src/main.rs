@@ -1,7 +1,7 @@
 use clap::Parser;
 use disk_organizer::scan::aggregate::aggregate;
 use disk_organizer::classify::cut::cut;
-use disk_organizer::enrich::{self, Backend, LlmConfig};
+use disk_organizer::enrich::{self, Backend, LlmConfig, VideoConfig};
 use disk_organizer::scan::index::build_index;
 use disk_organizer::model::{RawRecord, Source};
 use disk_organizer::report::{self, ReportFile};
@@ -54,6 +54,35 @@ struct Args {
     /// Number of filenames to sample per unknown directory (default: 20)
     #[arg(long, default_value_t = 20)]
     llm_samples: usize,
+    /// Look inside a video and describe what it probably contains, then exit
+    #[arg(long)]
+    describe_video: Option<PathBuf>,
+    /// GGUF vision model llama-server loads for --describe-video
+    #[arg(long, default_value = "tools/models/SmolVLM2-500M-Video-Instruct-Q8_0.gguf")]
+    vlm_model_path: PathBuf,
+    /// Multimodal projector (mmproj) GGUF that pairs with the vision model
+    #[arg(long, default_value = "tools/models/mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf")]
+    vlm_mmproj_path: PathBuf,
+    /// Folder containing ffmpeg and ffprobe
+    #[arg(long, default_value = "tools/ffmpeg")]
+    ffmpeg_dir: PathBuf,
+    /// Port the vision llama-server listens on
+    #[arg(long, default_value_t = 8090)]
+    vlm_port: u16,
+    /// Fraction of a video's frames to look at
+    #[arg(long, default_value_t = 0.001)]
+    vlm_frame_rate: f64,
+    /// Fewest frames to sample
+    #[arg(long, default_value_t = 4)]
+    vlm_min_frames: u32,
+    /// Most frames to sample
+    #[arg(long, default_value_t = 16)]
+    vlm_max_frames: u32,
+    /// Shrink each frame's longest side to N px before montage (0 = off).
+    /// Default 512 keeps the montage under llama-server's payload limit; full
+    /// 4K frames otherwise produce a base64 body the server rejects (413).
+    #[arg(long, default_value_t = 512)]
+    vlm_downscale: u32,
     /// Enable debug mode: verbose logs written to disk (disk_organizer.log)
     #[arg(long)]
     debug: bool,
@@ -76,6 +105,35 @@ fn main() -> std::io::Result<()> {
         info!("Reading MFT for {drive}: (size audit, requires Administrator) ...");
         let image = disk_organizer::scan::volume::read_mft(&drive)?;
         disk_organizer::scan::mft::size_audit(image.bytes);
+        return Ok(());
+    }
+
+    // Diagnostic short-circuit: describe a single video, print JSON, exit.
+    if let Some(video) = args.describe_video.clone() {
+        let cfg = VideoConfig {
+            model_path: args.vlm_model_path.clone(),
+            mmproj_path: args.vlm_mmproj_path.clone(),
+            tools_dir: args.tools_dir.clone(),
+            ffmpeg_dir: args.ffmpeg_dir.clone(),
+            backend_prefs: parse_backends(&args.backend),
+            port: args.vlm_port,
+            ngl: args.llm_ngl,
+            frame_fraction: args.vlm_frame_rate,
+            min_frames: args.vlm_min_frames,
+            max_frames: args.vlm_max_frames,
+            shrink: if args.vlm_downscale == 0 { None } else { Some(args.vlm_downscale) },
+        };
+        match enrich::describe_video(&video, &cfg) {
+            Ok(guess) => {
+                let json = serde_json::to_string_pretty(&guess)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                println!("{json}");
+            }
+            Err(e) => {
+                error!("describe-video failed: {e}");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 

@@ -1,10 +1,12 @@
 ﻿mod backend;
 mod client;
 mod content;
+mod frames;
 mod lifecycle;
 mod llm;
 mod orchestrator;
 mod server;
+mod video;
 
 use crate::scan::index::Index;
 use crate::model::{Item, Source};
@@ -30,6 +32,7 @@ pub use lifecycle::health_check as is_ollama_running;
 pub use lifecycle::preload_model;
 pub use llm::summarize_report;
 pub use llm::{DirSummary, FinalReport, parse_risk};
+pub use video::{describe_video, Confidence, VideoCategory, VideoConfig, VideoContentGuess};
 
 // ---- Re-export centralized constants (convenience for intra-module use) ----
 use crate::consts::{

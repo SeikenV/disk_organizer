@@ -31,6 +31,33 @@ pub fn build_json_body(system: &str, user: &str, schema: Value, max_tokens: u32)
     })
 }
 
+/// Build a vision chat-completions body: a text instruction plus one PNG image
+/// (base64 data-URI), JSON-schema-constrained, reasoning disabled.
+pub fn build_image_request(
+    system: &str,
+    user: &str,
+    image_png: &[u8],
+    schema: Value,
+    max_tokens: u32,
+) -> Value {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image_png);
+    let data_uri = format!("data:image/png;base64,{b64}");
+    json!({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [
+                {"type": "text", "text": user},
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            ]}
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}},
+        "chat_template_kwargs": {"enable_thinking": false}
+    })
+}
+
 /// POST a chat request and return the assistant message `content`.
 pub fn chat(endpoint: &str, body: &Value) -> Result<String, String> {
     let http = local_client();
@@ -64,6 +91,22 @@ mod tests {
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["content"], "usr");
+        assert_eq!(b["max_tokens"], 256);
+    }
+
+    #[test]
+    fn image_request_has_text_and_image_parts() {
+        let schema = json!({"type":"object"});
+        let b = build_image_request("sys", "describe", &[1u8, 2, 3], schema, 256);
+        assert_eq!(b["messages"][0]["role"], "system");
+        let content = &b["messages"][1]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        assert_eq!(b["response_format"]["type"], "json_schema");
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(b["max_tokens"], 256);
     }
 }

@@ -257,6 +257,7 @@ dependencies = [
 name = "disk_organizer"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "flexi_logger",
