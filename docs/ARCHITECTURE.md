@@ -75,8 +75,11 @@ scan/
   snapshot.rs      扫描快照 save/load（JSON，免管理员复跑）
 
 classify/
-  catalog.rs       已知目录知识库与匹配
+  catalog.rs       已知目录知识库与匹配；is_container 区分"容器/叶子"目录
   cut.rs           递归切割成 Item，贴规则分类（Rule/Heuristic/Unknown）
+                   叶子目录(缓存/系统，如 npm-cache/WinSxS)整体作为一个 Item 且不再下钻；
+                   容器目录(用户数据：用户主目录及 Downloads/Videos/Pictures/Documents/Desktop)
+                   会下钻，把内部大文件/子目录各自暴露成 Item（残余部分仍带容器标签）
   tree.rs          切割辅助树结构
 
 enrich/                         （增强层 —— 见 §5）

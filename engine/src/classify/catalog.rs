@@ -113,6 +113,24 @@ pub fn catalog() -> &'static [CatalogEntry] {
     ]
 }
 
+/// True if a matched entry is a *container* the cut should descend INTO (to
+/// surface the large files/subdirs inside) rather than collapse as one item.
+///
+/// User-data directories hold the things a user actually wants to see and clean
+/// (big downloads, videos, etc.), so we drill in. Caches/system dirs stay leaves
+/// (e.g. npm-cache is one unit — you don't want 300k individual cache files).
+pub fn is_container(entry: &CatalogEntry) -> bool {
+    matches!(
+        entry.pattern,
+        "users/*"
+            | "users/*/downloads"
+            | "users/*/videos"
+            | "users/*/pictures"
+            | "users/*/documents"
+            | "users/*/desktop"
+    )
+}
+
 /// Lowercase '/'-separated components of a path.
 fn components(path: &Path) -> Vec<String> {
     path.to_string_lossy()

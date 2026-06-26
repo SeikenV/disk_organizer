@@ -1,4 +1,4 @@
-use crate::classify::catalog::match_path;
+use crate::classify::catalog::{is_container, match_path, CatalogEntry};
 use crate::scan::index::Index;
 use crate::model::{DirAgg, Item, Risk, Source, ROOT_FRN};
 use crate::scan::paths::path_for;
@@ -34,6 +34,9 @@ struct Frame {
     path: Option<PathBuf>,
     /// Index into index.children[frn] for the next child to process.
     child_index: usize,
+    /// Catalog label for a *container* dir we descended into: its leftover
+    /// (residual) bytes are emitted with this label instead of "Unknown".
+    label: Option<&'static CatalogEntry>,
 }
 
 /// Iterative DFS traversal — uses an explicit Vec-based stack so that
@@ -58,6 +61,7 @@ fn walk_iterative(
         self_count: root_count,
         path: None,
         child_index: 0,
+        label: None,
     });
     visited.insert(ROOT_FRN);
 
@@ -92,16 +96,33 @@ fn walk_iterative(
                     let residual = frame.self_total.saturating_sub(frame.claimed);
                     let mut subtree_claimed = frame.claimed;
                     if residual >= threshold {
+                        // For a descended container, label its leftover with the
+                        // catalog entry (e.g. "Downloads", Caution); otherwise it
+                        // is genuinely unclassified.
+                        let (category, purpose, risk, source) = match frame.label {
+                            Some(e) => (
+                                e.category.to_string(),
+                                e.purpose.to_string(),
+                                e.risk,
+                                Source::Rule,
+                            ),
+                            None => (
+                                "Unknown".to_string(),
+                                "Unclassified directory contents".to_string(),
+                                Risk::Unknown,
+                                Source::Unknown,
+                            ),
+                        };
                         out.push(Item {
                             frn: frame.frn,
                             path: frame.path.expect("non-root frame must have path"),
                             is_dir: true,
                             physical_size: residual,
                             file_count: frame.self_count,
-                            category: "Unknown".to_string(),
-                            purpose: "Unclassified directory contents".to_string(),
-                            risk: Risk::Unknown,
-                            source: Source::Unknown,
+                            category,
+                            purpose,
+                            risk,
+                            source,
                         });
                         subtree_claimed += residual;
                     }
@@ -132,34 +153,54 @@ fn walk_iterative(
 
                     let path = path_for(child_frn, index, cache);
 
-                    // Catalog match → whole subtree as one item; don't descend.
-                    if let Some(entry) = match_path(&path) {
-                        out.push(Item {
-                            frn: child_frn,
-                            path,
-                            is_dir: true,
-                            physical_size: total,
-                            file_count: count,
-                            category: entry.category.to_string(),
-                            purpose: entry.purpose.to_string(),
-                            risk: entry.risk,
-                            source: Source::Rule,
-                        });
-                        // Claim the whole subtree size on the parent.
-                        if let Some(parent) = stack.last_mut() {
-                            parent.claimed += total;
+                    match match_path(&path) {
+                        // Container catalog dir (user data) → descend to surface
+                        // the big files/subdirs inside; carry the label for the
+                        // residual. Leftover small content stays labeled (Rule).
+                        Some(entry) if is_container(entry) => {
+                            stack.push(Frame {
+                                frn: child_frn,
+                                is_root: false,
+                                claimed: 0,
+                                self_total: total,
+                                self_count: count,
+                                path: Some(path),
+                                child_index: 0,
+                                label: Some(entry),
+                            });
                         }
-                    } else {
+                        // Leaf catalog dir (cache/system) → whole subtree as one
+                        // item; don't descend.
+                        Some(entry) => {
+                            out.push(Item {
+                                frn: child_frn,
+                                path,
+                                is_dir: true,
+                                physical_size: total,
+                                file_count: count,
+                                category: entry.category.to_string(),
+                                purpose: entry.purpose.to_string(),
+                                risk: entry.risk,
+                                source: Source::Rule,
+                            });
+                            // Claim the whole subtree size on the parent.
+                            if let Some(parent) = stack.last_mut() {
+                                parent.claimed += total;
+                            }
+                        }
                         // Unknown directory — push a frame and descend.
-                        stack.push(Frame {
-                            frn: child_frn,
-                            is_root: false,
-                            claimed: 0,
-                            self_total: total,
-                            self_count: count,
-                            path: Some(path),
-                            child_index: 0,
-                        });
+                        None => {
+                            stack.push(Frame {
+                                frn: child_frn,
+                                is_root: false,
+                                claimed: 0,
+                                self_total: total,
+                                self_count: count,
+                                path: Some(path),
+                                child_index: 0,
+                                label: None,
+                            });
+                        }
                     }
                 } else if rec.physical_size >= threshold {
                     // Large loose file.
@@ -251,18 +292,45 @@ mod tests {
     }
 
     #[test]
-    fn known_dir_is_cut_as_one_item() {
+    fn user_profile_is_descended_to_surface_children() {
         let (index, totals) = fixture();
         let items = cut(&index, &totals, 100);
-        // \Users\dongm now matches the "users/*" catalog entry (User profile, System).
-        // It swallows all children, including npm-cache.
-        let user = items.iter().find(|i| i.path.ends_with("dongm")).expect("User profile item");
-        assert_eq!(user.source, Source::Rule);
-        assert_eq!(user.risk, Risk::System);
-        assert_eq!(user.physical_size, 1800);
-        // npm-cache and its blob are swallowed — they must NOT appear.
-        assert!(!items.iter().any(|i| i.path.ends_with("npm-cache")));
-        assert!(!items.iter().any(|i| i.path.ends_with("blob")));
+        // \Users\dongm is a *container* (user data) — we descend into it instead
+        // of collapsing the whole profile into one opaque item.
+        assert!(
+            !items.iter().any(|i| i.path.ends_with("dongm") && i.physical_size == 1800),
+            "the whole profile must NOT be one swallowing item"
+        );
+        // The cache leaf inside still collapses as one Rule item.
+        let npm = items.iter().find(|i| i.path.ends_with("npm-cache")).expect("npm-cache item");
+        assert_eq!(npm.source, Source::Rule);
+        assert_eq!(npm.risk, Risk::Safe);
+        // The large loose file inside the profile is now surfaced individually.
+        let big = items.iter().find(|i| i.path.ends_with("big.bin")).expect("big.bin item");
+        assert_eq!(big.source, Source::Heuristic);
+        assert_eq!(big.physical_size, 800);
+    }
+
+    #[test]
+    fn large_video_in_downloads_is_surfaced() {
+        // \Users\dongm\Downloads\movie.mkv must become its own (Video) item so
+        // downstream --describe-videos-from can find it.
+        let records = vec![
+            dir(10, ROOT_FRN, "Users"),
+            dir(11, 10, "dongm"),
+            dir(12, 11, "Downloads"),
+            file(20, 12, "movie.mkv", 500),
+        ];
+        let index = crate::scan::index::build_index(records);
+        let totals = crate::scan::aggregate::aggregate(&index);
+        let items = cut(&index, &totals, 100);
+        let vid = items
+            .iter()
+            .find(|i| i.path.ends_with("movie.mkv"))
+            .expect("movie.mkv item");
+        assert!(!vid.is_dir);
+        assert_eq!(vid.category, "Video");
+        assert_eq!(vid.physical_size, 500);
     }
 
     #[test]
