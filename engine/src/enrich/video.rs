@@ -113,12 +113,17 @@ pub fn describe_video(path: &Path, cfg: &VideoConfig) -> Result<VideoContentGues
     }
 
     // 1. Decide how many frames, build the montage.
-    let total = frames::count_total_frames(&ffprobe, path)?;
-    let count = frames::frames_to_sample(total, cfg.frame_fraction, cfg.min_frames, cfg.max_frames);
+    let meta = frames::probe_video(&ffprobe, path)?;
+    let count = frames::frames_to_sample(
+        meta.total_frames,
+        cfg.frame_fraction,
+        cfg.min_frames,
+        cfg.max_frames,
+    );
     let montage_path = std::env::temp_dir()
         .join(format!("disk_org_montage_{}.png", std::process::id()));
     let montage = TempPng(montage_path);
-    frames::build_montage(&ffmpeg, path, total, count, cfg.shrink, &montage.0)?;
+    frames::build_montage(&ffmpeg, path, meta.duration_secs, count, cfg.shrink, &montage.0)?;
     let png = std::fs::read(&montage.0).map_err(|e| format!("read montage: {e}"))?;
 
     // 2. Start the vision server (owned; Drop kills it).
@@ -138,14 +143,12 @@ pub fn describe_video(path: &Path, cfg: &VideoConfig) -> Result<VideoContentGues
         path.display()
     );
 
-    // 3. Ask, parse.
-    let filename = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // 3. Ask, parse. Deliberately omit the filename: the goal is to describe
+    // opaquely-named videos from their frames, and including the name makes a
+    // small model echo it instead of describing what it sees.
     let user = format!(
-        "Here is a montage of {count} frames from the video '{filename}'. \
-         What does this video most likely contain?"
+        "Here is a montage of {count} frames sampled evenly from one video. \
+         Describe what the video most likely contains, based only on the frames."
     );
     let body = super::client::build_image_request(VISION_SYSTEM, &user, &png, guess_schema(), 256);
     let raw = super::client::chat(server.endpoint(), &body)?;

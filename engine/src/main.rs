@@ -78,9 +78,11 @@ struct Args {
     /// Most frames to sample
     #[arg(long, default_value_t = 16)]
     vlm_max_frames: u32,
-    /// Shrink each frame's longest side to N px before analysis (default: off)
-    #[arg(long)]
-    vlm_downscale: Option<u32>,
+    /// Shrink each frame's longest side to N px before montage (0 = off).
+    /// Default 512 keeps the montage under llama-server's payload limit; full
+    /// 4K frames otherwise produce a base64 body the server rejects (413).
+    #[arg(long, default_value_t = 512)]
+    vlm_downscale: u32,
     /// Enable debug mode: verbose logs written to disk (disk_organizer.log)
     #[arg(long)]
     debug: bool,
@@ -119,7 +121,7 @@ fn main() -> std::io::Result<()> {
             frame_fraction: args.vlm_frame_rate,
             min_frames: args.vlm_min_frames,
             max_frames: args.vlm_max_frames,
-            shrink: args.vlm_downscale,
+            shrink: if args.vlm_downscale == 0 { None } else { Some(args.vlm_downscale) },
         };
         match enrich::describe_video(&video, &cfg) {
             Ok(guess) => {

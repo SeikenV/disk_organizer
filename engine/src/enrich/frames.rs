@@ -30,14 +30,23 @@ fn parse_fps(s: &str) -> f64 {
     }
 }
 
-/// Estimate a video's total frame count via ffprobe (duration × avg_frame_rate).
-/// Approximate by design — the count only feeds `frames_to_sample`'s clamp.
-pub fn count_total_frames(ffprobe: &Path, video: &Path) -> Result<u64, String> {
+/// Video metadata needed to sample frames.
+pub struct VideoMeta {
+    pub duration_secs: f64,
+    pub total_frames: u64,
+}
+
+/// Probe a video's duration and (approximate) total frame count via ffprobe
+/// (`duration × avg_frame_rate`). Approximate is fine — `total_frames` only
+/// feeds `frames_to_sample`'s clamp, and `duration_secs` drives seek timestamps.
+pub fn probe_video(ffprobe: &Path, video: &Path) -> Result<VideoMeta, String> {
     let out = Command::new(ffprobe)
         .args([
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=duration,avg_frame_rate",
+            // Container (format) duration is reliable across mp4/mkv; some
+            // streams omit a per-stream duration, so read format first.
+            "-show_entries", "format=duration:stream=avg_frame_rate",
             "-of", "json",
         ])
         .arg(video)
@@ -51,54 +60,82 @@ pub fn count_total_frames(ffprobe: &Path, video: &Path) -> Result<u64, String> {
     }
     let v: Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("parse ffprobe json: {e}"))?;
-    let stream = &v["streams"][0];
-    let duration: f64 = stream["duration"]
+    let duration: f64 = v["format"]["duration"]
         .as_str()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| "ffprobe: no stream duration".to_string())?;
-    let fps = parse_fps(stream["avg_frame_rate"].as_str().unwrap_or("0/1"));
+        .or_else(|| v["streams"][0]["duration"].as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| "ffprobe: no duration".to_string())?;
+    let fps = parse_fps(v["streams"][0]["avg_frame_rate"].as_str().unwrap_or("0/1"));
     let total = (duration * fps).round() as u64;
     if total == 0 {
         return Err("video has 0 frames".into());
     }
-    Ok(total)
+    Ok(VideoMeta { duration_secs: duration, total_frames: total })
+}
+
+/// Removes its directory (recursively) on drop, so extracted frames never linger.
+struct DirGuard(std::path::PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Composite `count` evenly-spaced frames from `video` into one montage PNG at
-/// `out`, in a single ffmpeg invocation (`select` → optional `scale` → `tile`).
+/// `out`. Frames are pulled by fast input-seek (`-ss` before `-i`, a keyframe
+/// seek that avoids decoding the whole file), each optionally shrunk to `shrink`
+/// px on its longest side, then tiled into a near-square grid.
 pub fn build_montage(
     ffmpeg: &Path,
     video: &Path,
-    total_frames: u64,
+    duration_secs: f64,
     count: u32,
     shrink: Option<u32>,
     out: &Path,
 ) -> Result<(), String> {
     let count = count.max(1);
     let (cols, rows) = montage_grid(count);
-    let step = (total_frames / count as u64).max(1);
-    // Pick every `step`-th decoded frame, then tile into a cols×rows grid.
-    let select = format!("select='not(mod(n\\,{step}))'");
+
+    // 1. Extract `count` frames at evenly-spaced timestamps into a temp dir.
+    let dir = std::env::temp_dir().join(format!("disk_org_frames_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mk temp frame dir: {e}"))?;
+    let guard = DirGuard(dir.clone());
+    for i in 0..count {
+        // Center each sample in its slice; keeps off the exact start/end.
+        let ts = duration_secs * (i as f64 + 0.5) / count as f64;
+        let frame = dir.join(format!("f_{:04}.png", i + 1));
+        let status = Command::new(ffmpeg)
+            .args(["-y", "-ss"])
+            .arg(format!("{ts:.3}"))
+            .arg("-i")
+            .arg(video)
+            .args(["-frames:v", "1"])
+            .arg(&frame)
+            .status()
+            .map_err(|e| format!("run ffmpeg ({}): {e}", ffmpeg.display()))?;
+        if !status.success() || !frame.exists() {
+            return Err(format!("ffmpeg failed to extract frame at {ts:.1}s"));
+        }
+    }
+
+    // 2. Tile the extracted frames into one montage (optionally shrinking each).
     let scale = match shrink {
-        // Shrink the longest side to `s`, preserving aspect (per frame, pre-tile).
-        Some(s) => format!(
-            ",scale='if(gt(iw,ih),{s},-1)':'if(gt(iw,ih),-1,{s})'"
-        ),
+        Some(s) => format!("scale='if(gt(iw,ih),{s},-1)':'if(gt(iw,ih),-1,{s})',"),
         None => String::new(),
     };
-    let vf = format!("{select}{scale},tile={cols}x{rows}");
+    let vf = format!("{scale}tile={cols}x{rows}");
+    let pattern = dir.join("f_%04d.png");
     let status = Command::new(ffmpeg)
-        .args(["-y", "-i"])
-        .arg(video)
-        .args(["-vf", &vf, "-frames:v", "1", "-fps_mode", "vfr"])
+        .args(["-y", "-framerate", "1", "-i"])
+        .arg(&pattern)
+        .args(["-vf", &vf, "-frames:v", "1", "-update", "1"])
         .arg(out)
         .status()
         .map_err(|e| format!("run ffmpeg ({}): {e}", ffmpeg.display()))?;
-    if !status.success() {
-        return Err("ffmpeg montage failed".into());
-    }
-    if !out.exists() {
-        return Err("ffmpeg produced no montage file".into());
+    drop(guard);
+    if !status.success() || !out.exists() {
+        return Err("ffmpeg montage tiling failed".into());
     }
     Ok(())
 }
@@ -144,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn count_frames_errors_when_ffprobe_missing() {
-        let r = count_total_frames(
+    fn probe_errors_when_ffprobe_missing() {
+        let r = probe_video(
             std::path::Path::new("definitely_not_ffprobe_xyz"),
             std::path::Path::new("nope.mp4"),
         );
@@ -157,7 +194,7 @@ mod tests {
         let r = build_montage(
             std::path::Path::new("definitely_not_ffmpeg_xyz"),
             std::path::Path::new("nope.mp4"),
-            1000,
+            120.0,
             4,
             None,
             std::path::Path::new("out.png"),
