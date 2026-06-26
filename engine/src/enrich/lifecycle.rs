@@ -1,30 +1,36 @@
 //! Model lifecycle + backend reachability for LLM enrichment.
 //!
-//! These functions manage the inference backend itself (is it up, is the model
-//! warm) as opposed to the per-item prompting in `llm.rs`. Splitting them out
-//! gives a clean seam for swapping or pooling multiple LLM backends.
+//! These functions probe the inference backend itself (is it up, is the model
+//! warm) as opposed to the per-item prompting in `llm.rs`. With the llama-server
+//! backend the model is loaded when the server starts (see `server.rs`), so
+//! "health" is a `GET /health` poll and "preload" is a tiny priming request.
+//! Splitting them out keeps a clean seam for pooling multiple LLM backends.
 
-use ollama_rs::generation::completion::request::GenerationRequest;
-
-use super::llm::{block_generate, keep_10m, ollama_from_endpoint, tk_rt};
-
-/// True if an Ollama-compatible server is reachable at `endpoint`.
+/// True if a llama-server is reachable and ready at `endpoint`.
+///
+/// llama-server answers `GET /health` with `200 {"status":"ok"}` once the model
+/// is loaded (and `503` while still loading), so a 2xx here means ready to serve.
 pub fn health_check(endpoint: &str) -> bool {
-    let ollama = ollama_from_endpoint(endpoint);
-    tk_rt()
-        .block_on(async { ollama.list_local_models().await })
-        .is_ok()
+    let http = crate::enrich::client::local_client();
+    http.get(format!("{endpoint}/health"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
-/// Preload a model into GPU memory so the first real request isn't cold-start.
+/// Prime the model so the first real request isn't a cold start.
 ///
-/// Sends a tiny generation request and sets `keep_alive` to 10 minutes.
-/// Subsequent requests with `keep_alive` will extend the lifetime.
-pub fn preload_model(endpoint: &str, model: &str) -> Result<(), String> {
-    let ollama = ollama_from_endpoint(endpoint);
-    let req = GenerationRequest::new(model.to_string(), ".")
-        .think(true)
-        .keep_alive(keep_10m());
-    block_generate(&ollama, req)?;
+/// The model is already resident once the server is healthy; this sends a tiny
+/// generation to warm the first-token path. Failures are surfaced so callers can
+/// fall back to rule/heuristic-only enrichment.
+pub fn preload_model(endpoint: &str, _model: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "."}],
+        "max_tokens": 8,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": false}
+    });
+    crate::enrich::client::chat(endpoint, &body)?;
     Ok(())
 }

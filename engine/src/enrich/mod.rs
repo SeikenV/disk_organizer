@@ -1,7 +1,10 @@
-﻿mod content;
+﻿mod backend;
+mod client;
+mod content;
 mod lifecycle;
 mod llm;
 mod orchestrator;
+mod server;
 
 use crate::scan::index::Index;
 use crate::model::{Item, Source};
@@ -16,8 +19,13 @@ use std::thread;
 use std::time::Instant;
 
 use orchestrator::{run_supervisor, CwndCtl};
+use server::{start_with_fallback, ServerConfig};
 
+pub use backend::{default_prefs, select_backend, AcceleratorProbe, Backend};
 pub use content::analyze_directory_contents;
+// `is_backend_ready` is the current name; `is_ollama_running` is a deprecated
+// alias kept so external callers don't break during the backend migration.
+pub use lifecycle::health_check as is_backend_ready;
 pub use lifecycle::health_check as is_ollama_running;
 pub use lifecycle::preload_model;
 pub use llm::summarize_report;
@@ -31,23 +39,27 @@ use crate::consts::{
 
 // ---- Configuration ----
 
-/// Configuration for LLM enrichment.
+/// Configuration for LLM enrichment via a self-managed `llama-server`.
 ///
-/// Supports up to two inference backends:
-/// - `endpoint` (primary, typically dGPU Ollama)
-/// - `igpu_endpoint` (optional secondary, e.g. iGPU llama-server)
-///
-/// When both are set, `igpu_weight` fraction of worker threads are assigned to
-/// the iGPU backend. Each backend gets its own congestion-control state.
+/// `enrich_items` spawns one `llama-server` for `model_path`, selecting a
+/// compute backend from `backend_prefs` (CUDA → Vulkan → CPU) with graceful
+/// fallback, then shuts it down when the run finishes.
 pub struct LlmConfig {
-    /// dGPU / primary endpoint.
-    pub endpoint: String,
-    /// Optional iGPU / secondary endpoint.  `None` disables dual-backend mode.
-    pub igpu_endpoint: Option<String>,
-    /// Fraction of worker threads assigned to the iGPU backend (0.0–1.0).
-    /// Default 0.3 = 30 %.
-    pub igpu_weight: f64,
-    pub model: String,
+    /// Path to the GGUF model the server loads.
+    pub model_path: PathBuf,
+    /// Directory holding per-backend `llama-server` binaries
+    /// (`<tools_dir>/<backend>/llama-server`).
+    pub tools_dir: PathBuf,
+    /// Backend preference order; the first one that launches wins.
+    pub backend_prefs: Vec<Backend>,
+    /// Number of server slots (`--parallel`) and the concurrency ceiling.
+    pub parallel: usize,
+    /// Tokens of context per slot; total `-c` = `parallel × per_slot_ctx`.
+    pub per_slot_ctx: usize,
+    /// GPU layers to offload (`-ngl`); ignored on the CPU backend.
+    pub ngl: u32,
+    /// Port the server listens on.
+    pub port: u16,
     /// How many child filenames to sample per directory.
     pub sample_count: usize,
 }
@@ -55,10 +67,13 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:11434".into(),
-            igpu_endpoint: None,
-            igpu_weight: 0.3,
-            model: "qwen35-q4ud:0.8b".into(),
+            model_path: PathBuf::from("tools/models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"),
+            tools_dir: PathBuf::from("tools/llamacpp"),
+            backend_prefs: default_prefs(),
+            parallel: 4,
+            per_slot_ctx: 4096,
+            ngl: 999,
+            port: 8080,
             sample_count: 20,
         }
     }
@@ -124,45 +139,64 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     let dir_count = work.iter().filter(|w| matches!(w.kind, WorkKind::Dir { .. })).count();
     let file_count = total - dir_count;
 
-    // ---- Decide thread allocation ----
-    // Dynamic: 2× logical processors, capped by total work items.
-    // Each worker makes blocking HTTP calls to Ollama, so the 2×
-    // multiplier gives pipelining headroom above CPU count.
-    let worker_cap = crate::consts::worker_thread_limit(total);
-    let has_igpu = config.igpu_endpoint.is_some();
-    let igpu_threads = if has_igpu {
-        ((worker_cap as f64 * config.igpu_weight).ceil() as usize)
-            .clamp(1, worker_cap.saturating_sub(1))
-    } else {
-        0
+    // ---- Start the llama-server backend (CUDA → Vulkan → CPU fallback) ----
+    // We own the server for the lifetime of this run; its `Drop` shuts the
+    // child down when `server` leaves scope (the "unload after use" policy).
+    let model_label = config
+        .model_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "llama-server".to_string());
+
+    let server_cfg = ServerConfig {
+        model_path: config.model_path.clone(),
+        tools_dir: config.tools_dir.clone(),
+        port: config.port,
+        parallel: config.parallel,
+        per_slot_ctx: config.per_slot_ctx,
+        ngl: config.ngl,
+        mmproj: None,
     };
-    let gpu_threads = worker_cap - igpu_threads;
 
     info!(
-        "[LLM] Enriching {} item(s) ({} dirs, {} files) via {} (dGPU={} threads, iGPU={} threads, cwnd_init={}) ...",
-        total, dir_count, file_count, config.model, gpu_threads, igpu_threads, cwnd_init(),
+        "[LLM] Starting llama-server (model={model_label}, parallel={}, per_slot_ctx={}) ...",
+        config.parallel, config.per_slot_ctx,
+    );
+    let (backend, server) = match start_with_fallback(&config.backend_prefs, &server_cfg) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                "[LLM] Could not start any inference backend: {e}. \
+                 Skipping enrichment (keeping rule/heuristic results)."
+            );
+            info!("{}", setup_hint());
+            if let Some(ref mut rep) = report {
+                let _ = rep.line(&format!("[LLM] Backend unavailable, enrichment skipped: {e}"));
+            }
+            return;
+        }
+    };
+    let endpoint = server.endpoint().to_string();
+    info!("[LLM] llama-server ready on {endpoint} (backend={backend:?}).");
+
+    // ---- Decide thread allocation ----
+    // Concurrency is capped at `--parallel`: llama-server has exactly that many
+    // slots, so extra worker threads would only queue server-side.  We also
+    // never spawn more threads than there are work items.
+    let worker_cap = crate::consts::worker_thread_limit(total).min(config.parallel.max(1));
+
+    info!(
+        "[LLM] Enriching {} item(s) ({} dirs, {} files) via {} (workers={}, cwnd_init={}) ...",
+        total, dir_count, file_count, model_label, worker_cap, cwnd_init(),
     );
 
     let start_time = Instant::now();
 
-    // ---- Backend-specific state ----
-    // ollama-rs manages its own HTTP connection pool internally.
-    // We just pass endpoint strings — each llm:: function creates an Ollama
-    // instance on the fly (cheap, just wraps a URL).
+    let gpu_endpoint = Arc::new(endpoint.clone());
 
-    let gpu_endpoint = Arc::new(config.endpoint.clone());
-
-    let (igpu_endpoint_arc, igpu_cwnd_ctl): (Option<Arc<String>>, Option<Arc<CwndCtl>>) = if has_igpu {
-        let ep = Arc::new(config.igpu_endpoint.clone().unwrap());
-        let cc = Arc::new(CwndCtl::new());
-        (Some(ep), Some(cc))
-    } else {
-        (None, None)
-    };
-
-    // ---- Preload model into GPU memory (avoids cold-start on first request) ----
-    info!("[LLM] Preloading model '{}' into memory ...", config.model);
-    if let Err(e) = lifecycle::preload_model(&config.endpoint, &config.model) {
+    // ---- Preload model (avoid cold-start on the first real request) ----
+    info!("[LLM] Preloading model '{model_label}' into memory ...");
+    if let Err(e) = lifecycle::preload_model(&endpoint, &model_label) {
         warn!("[LLM] Model preload failed (non-fatal): {e}");
     } else {
         info!("[LLM] Model preloaded successfully.");
@@ -171,7 +205,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     let gpu_cwnd_ctl = Arc::new(CwndCtl::new());
     let next_idx = Arc::new(AtomicUsize::new(0));
     let done_cnt = Arc::new(AtomicUsize::new(0));
-    let model = Arc::new(config.model.clone());
+    let model = Arc::new(model_label.clone());
 
     // ---- Performance counters ----
     let total_attempts_cnt = Arc::new(AtomicUsize::new(0));
@@ -182,25 +216,15 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
 
     // ---- Supervisor: sliding-window throughput probe + progress display ----
     let supervisor_gpu = Arc::clone(&gpu_cwnd_ctl);
-    let supervisor_igpu = igpu_cwnd_ctl.as_ref().map(Arc::clone);
     let supervisor_done = Arc::clone(&done_cnt);
     let supervisor_total = total;
     let supervisor_handle = thread::spawn(move || {
-        run_supervisor(
-            &supervisor_gpu,
-            supervisor_igpu.as_ref(),
-            supervisor_total,
-            &supervisor_done,
-        );
+        run_supervisor(&supervisor_gpu, None, supervisor_total, &supervisor_done);
     });
 
-    // Keep a clone of iGPU controller for final stats (scope consumes the original).
-    let igpu_cwnd_for_stats = igpu_cwnd_ctl.as_ref().map(Arc::clone);
-
     // ---- Worker threads ----
-    // GPU and iGPU workers pull from the same `next_idx` counter. Each backend
-    // has its own congestion controller. The iGPU cwnd naturally settles lower
-    // (higher per-request latency), so neither starves the other.
+    // All workers pull from the same `next_idx` counter and share one congestion
+    // controller; concurrency is bounded by `worker_cap` (= --parallel slots).
     let (results, failures): (Vec<(usize, DirSummary)>, Vec<(usize, String)>) = thread::scope(|s| {
         let mut handles = Vec::with_capacity(worker_cap);
 
@@ -293,13 +317,8 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
             }
         };
 
-        // Spawn dGPU group.
-        spawn_workers(&mut handles, gpu_threads, Arc::clone(&gpu_cwnd_ctl), Arc::clone(&gpu_endpoint));
-
-        // Spawn iGPU group (if configured).
-        if let (Some(ep), Some(cc)) = (igpu_endpoint_arc, igpu_cwnd_ctl) {
-            spawn_workers(&mut handles, igpu_threads, Arc::clone(&cc), Arc::clone(&ep));
-        }
+        // Spawn the worker pool against the single llama-server backend.
+        spawn_workers(&mut handles, worker_cap, Arc::clone(&gpu_cwnd_ctl), Arc::clone(&gpu_endpoint));
 
         // Merge.
         let mut merged_results = Vec::with_capacity(work.len());
@@ -336,30 +355,13 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     let gpu_peak = gpu_cwnd_ctl.peak_inflight.load(Ordering::Relaxed);
     let gpu_peak_cw = gpu_cwnd_ctl.peak_cwnd.load(Ordering::Relaxed);
 
-    if has_igpu {
-        if let Some(ref ic) = igpu_cwnd_for_stats {
-            let i_final_cw = ic.cwnd.load(Ordering::Relaxed);
-            let i_final_srtt = ic.srtt();
-            let i_peak = ic.peak_inflight.load(Ordering::Relaxed);
-            let i_peak_cw = ic.peak_cwnd.load(Ordering::Relaxed);
-            info!(
-                "\r[LLM] Enrichment complete. {ok}/{total} succeeded, {fail} failed. \
-                 Elapsed: {elapsed:.1?}. Avg/req: {avg_ms:.0} ms.\n\
-                 \x20 dGPU: srtt={gpu_final_srtt:.0}ms, peak inflight={gpu_peak}, \
-                 peak cwnd={gpu_peak_cw}, final cwnd={gpu_final_cw}\n\
-                 \x20 iGPU: srtt={i_final_srtt:.0}ms, peak inflight={i_peak}, \
-                 peak cwnd={i_peak_cw}, final cwnd={i_final_cw}",
-            );
-        }
-    } else {
-        info!(
-            "\r[LLM] Enrichment complete. {ok}/{total} succeeded, {fail} failed. \
-             Elapsed: {elapsed:.1?}. \
-             Avg/req: {avg_ms:.0} ms. \
-             SRTT: {gpu_final_srtt:.0} ms. \
-             Peak inflight: {gpu_peak}, peak cwnd: {gpu_peak_cw}, final cwnd: {gpu_final_cw}."
-        );
-    }
+    info!(
+        "\r[LLM] Enrichment complete. {ok}/{total} succeeded, {fail} failed. \
+         Elapsed: {elapsed:.1?}. \
+         Avg/req: {avg_ms:.0} ms. \
+         SRTT: {gpu_final_srtt:.0} ms. \
+         Peak inflight: {gpu_peak}, peak cwnd: {gpu_peak_cw}, final cwnd: {gpu_final_cw}."
+    );
 
     // Counters.
     let tot_attempts = total_attempts_cnt.load(Ordering::Relaxed);
@@ -427,7 +429,7 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                 }
 
                 let _ = rep.section("COMPLETION SUMMARY");
-                let _ = rep.kv("model", &config.model);
+                let _ = rep.kv("model", &model_label);
                 let _ = rep.kv("succeeded", &format!("{ok}/{total}"));
                 let _ = rep.kv("failed", &format!("{fail}"));
                 let _ = rep.kv("elapsed", &crate::report::fmt_dur(elapsed));
@@ -510,15 +512,13 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
     let system_total = items.iter().filter(|it| it.risk == crate::model::Risk::System).count();
     let unknown_total = items.iter().filter(|it| it.risk == crate::model::Risk::Unknown).count();
 
-    // Final report uses a FRESH client — not the shared pool from workers.
-    // After hundreds of concurrent requests the shared pool may hold half-closed
-    // connections.  A new client gets a clean TCP connection.
-    // Quick health check first to avoid 30s timeouts if Ollama is momentarily down.
+    // Quick health check first to avoid long timeouts if the server is
+    // momentarily busy after the concurrent enrichment burst.
     let mut report_result = Err("unreachable".to_string());
-    if !lifecycle::health_check(&config.endpoint) {
-        warn!("\n[LLM] Ollama not responding, skipping final report.");
+    if !lifecycle::health_check(&endpoint) {
+        warn!("\n[LLM] llama-server not responding, skipping final report.");
         if let Some(ref mut rep) = report {
-            let _ = rep.line("[LLM] Ollama not responding, skipping final report.");
+            let _ = rep.line("[LLM] llama-server not responding, skipping final report.");
         }
     } else {
         for attempt in 1..=3 {
@@ -528,8 +528,8 @@ pub fn enrich_items(config: &LlmConfig, items: &mut [Item], index: &Index, repor
                 info!("\n[LLM] Requesting final summary and cleanup plan...");
             }
             report_result = llm::summarize_report(
-                &config.endpoint,
-                &config.model,
+                &endpoint,
+                &model_label,
                 &safe_items,
                 &caution_items,
                 &system_items,
@@ -815,10 +815,11 @@ fn do_summarize(endpoint: &str, model: &str, wi: &WorkItem) -> Result<DirSummary
 
 // ---- Setup hint ----
 
-/// Tell the user what to do when Ollama is not available.
+/// Tell the user what to do when no inference backend is available.
 pub fn setup_hint() -> &'static str {
-    "LLM enrichment not available (Ollama not running at http://localhost:11434).\n\
-     To install: .\\scripts\\setup_ollama.ps1\n\
+    "LLM enrichment not available (could not start llama-server).\n\
+     Install the pinned binaries: .\\scripts\\setup_tools.ps1\n\
+     and pass --llm-model-path <model.gguf>.\n\
      Falling back to rule-only mode."
 }
 
