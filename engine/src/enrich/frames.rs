@@ -1,6 +1,10 @@
 //! Frame extraction for video description: ffmpeg/ffprobe subprocess calls
 //! plus the pure sampling/layout math they depend on.
 
+use serde_json::Value;
+use std::path::Path;
+use std::process::Command;
+
 /// How many frames to sample: `clamp(round(fraction * total), min, max)`.
 pub fn frames_to_sample(total: u64, fraction: f64, min: u32, max: u32) -> u32 {
     let raw = (total as f64 * fraction).round() as i64;
@@ -12,6 +16,91 @@ pub fn montage_grid(n: u32) -> (u32, u32) {
     let cols = ((n as f64).sqrt().ceil() as u32).max(1);
     let rows = (n + cols - 1) / cols;
     (cols, rows)
+}
+
+/// Parse an ffprobe frame-rate string like "30000/1001" or "25/1" into fps.
+fn parse_fps(s: &str) -> f64 {
+    match s.split_once('/') {
+        Some((n, d)) => {
+            let n: f64 = n.parse().unwrap_or(0.0);
+            let d: f64 = d.parse().unwrap_or(1.0);
+            if d == 0.0 { 0.0 } else { n / d }
+        }
+        None => s.parse().unwrap_or(0.0),
+    }
+}
+
+/// Estimate a video's total frame count via ffprobe (duration × avg_frame_rate).
+/// Approximate by design — the count only feeds `frames_to_sample`'s clamp.
+pub fn count_total_frames(ffprobe: &Path, video: &Path) -> Result<u64, String> {
+    let out = Command::new(ffprobe)
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration,avg_frame_rate",
+            "-of", "json",
+        ])
+        .arg(video)
+        .output()
+        .map_err(|e| format!("run ffprobe ({}): {e}", ffprobe.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse ffprobe json: {e}"))?;
+    let stream = &v["streams"][0];
+    let duration: f64 = stream["duration"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "ffprobe: no stream duration".to_string())?;
+    let fps = parse_fps(stream["avg_frame_rate"].as_str().unwrap_or("0/1"));
+    let total = (duration * fps).round() as u64;
+    if total == 0 {
+        return Err("video has 0 frames".into());
+    }
+    Ok(total)
+}
+
+/// Composite `count` evenly-spaced frames from `video` into one montage PNG at
+/// `out`, in a single ffmpeg invocation (`select` → optional `scale` → `tile`).
+pub fn build_montage(
+    ffmpeg: &Path,
+    video: &Path,
+    total_frames: u64,
+    count: u32,
+    shrink: Option<u32>,
+    out: &Path,
+) -> Result<(), String> {
+    let count = count.max(1);
+    let (cols, rows) = montage_grid(count);
+    let step = (total_frames / count as u64).max(1);
+    // Pick every `step`-th decoded frame, then tile into a cols×rows grid.
+    let select = format!("select='not(mod(n\\,{step}))'");
+    let scale = match shrink {
+        // Shrink the longest side to `s`, preserving aspect (per frame, pre-tile).
+        Some(s) => format!(
+            ",scale='if(gt(iw,ih),{s},-1)':'if(gt(iw,ih),-1,{s})'"
+        ),
+        None => String::new(),
+    };
+    let vf = format!("{select}{scale},tile={cols}x{rows}");
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-i"])
+        .arg(video)
+        .args(["-vf", &vf, "-frames:v", "1", "-fps_mode", "vfr"])
+        .arg(out)
+        .status()
+        .map_err(|e| format!("run ffmpeg ({}): {e}", ffmpeg.display()))?;
+    if !status.success() {
+        return Err("ffmpeg montage failed".into());
+    }
+    if !out.exists() {
+        return Err("ffmpeg produced no montage file".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -44,5 +133,35 @@ mod tests {
         assert_eq!(montage_grid(5), (3, 2));
         assert_eq!(montage_grid(7), (3, 3));
         assert_eq!(montage_grid(1), (1, 1));
+    }
+
+    #[test]
+    fn fps_parses_ratio_and_plain() {
+        assert!((parse_fps("30000/1001") - 29.97).abs() < 0.01);
+        assert_eq!(parse_fps("25/1"), 25.0);
+        assert_eq!(parse_fps("0/0"), 0.0);
+        assert_eq!(parse_fps("24"), 24.0);
+    }
+
+    #[test]
+    fn count_frames_errors_when_ffprobe_missing() {
+        let r = count_total_frames(
+            std::path::Path::new("definitely_not_ffprobe_xyz"),
+            std::path::Path::new("nope.mp4"),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn build_montage_errors_when_ffmpeg_missing() {
+        let r = build_montage(
+            std::path::Path::new("definitely_not_ffmpeg_xyz"),
+            std::path::Path::new("nope.mp4"),
+            1000,
+            4,
+            None,
+            std::path::Path::new("out.png"),
+        );
+        assert!(r.is_err());
     }
 }
