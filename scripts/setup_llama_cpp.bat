@@ -6,26 +6,27 @@ cd /d "%~dp0"
 
 echo.
 echo ============================================
-echo   Ollama Setup for disk_organizer
+echo   llama.cpp Setup for disk_organizer
 echo ============================================
 echo.
-echo This will install Ollama and pull the model.
-echo (~1.5 GB download, one-time only)
+echo This will:
+echo   - detect llama-server.exe on your system
+echo   - add it to PATH if needed
+echo   - copy models from Downloads into tools\models
 echo.
 echo Log: %LOGFILE%
 echo.
 
 REM Initialize log in UTF-8 via PowerShell
-powershell -NoProfile -Command "'============================================', ' Ollama Setup started at %DATE% %TIME%', '============================================', '' | Out-File '%LOGFILE%' -Encoding utf8"
+powershell -NoProfile -Command "'============================================', ' llama.cpp Setup started at %DATE% %TIME%', '============================================', '' | Out-File '%LOGFILE%' -Encoding utf8"
 
 REM Run ps1: show on screen AND capture to UTF-8 log via tee_run helper
-powershell -ExecutionPolicy Bypass -File "%~dp0tee_run.ps1" -Script "%~dp0setup_ollama.ps1" -LogFile "%LOGFILE%"
+powershell -ExecutionPolicy Bypass -File "%~dp0tee_run.ps1" -Script "%~dp0setup_llama_cpp.ps1" -LogFile "%LOGFILE%"
 if %ERRORLEVEL% equ 0 (
     echo.
     echo ============================================
     echo   Setup complete! You can now use:
-    echo     cargo run --release -- C --llm
-    echo   Or double-click: test_llm_full.bat
+    echo     cargo run -p disk_organizer -- C --llm
     echo ============================================
     powershell -NoProfile -Command "'[%DATE% %TIME%] Setup OK' | Out-File '%LOGFILE%' -Encoding utf8 -Append"
 ) else (

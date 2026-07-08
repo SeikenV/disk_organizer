@@ -1,0 +1,42 @@
+[
+  {
+    "Backend": "cpu",
+    "PromptMean": 272.49311984670203,
+    "PromptMedian": 319.5472016153111,
+    "PromptStdDev": 124.18068239572005,
+    "EvalMean": 28.384699984031464,
+    "EvalMedian": 33.28616683492824,
+    "EvalStdDev": 12.93548774955417,
+    "Runs": 5
+  },
+  {
+    "Backend": "cuda",
+    "PromptMean": 121.61118208193236,
+    "PromptMedian": 100.54609095650754,
+    "PromptStdDev": 89.8303516824886,
+    "EvalMean": 12.667831466867955,
+    "EvalMedian": 10.473551141302867,
+    "EvalStdDev": 9.35732830025923,
+    "Runs": 5
+  },
+  {
+    "Backend": "vulkan0",
+    "PromptMean": 17.335672978748853,
+    "PromptMedian": 19.107599850793527,
+    "PromptStdDev": 4.025399643118342,
+    "EvalMean": 1.8057992686196722,
+    "EvalMedian": 1.9903749844576595,
+    "EvalStdDev": 0.41931246282482726,
+    "Runs": 5
+  },
+  {
+    "Backend": "vulkan1",
+    "PromptMean": 287.135485885189,
+    "PromptMedian": 349.7479901786392,
+    "PromptStdDev": 133.87959076201346,
+    "EvalMean": 29.90994644637385,
+    "EvalMedian": 36.43208231027493,
+    "EvalStdDev": 13.945790704376403,
+    "Runs": 5
+  }
+]

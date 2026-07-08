@@ -14,6 +14,53 @@ function Elapsed {
     return [math]::Round(((Get-Date) - $GlobalStart).TotalSeconds, 1)
 }
 
+# ---- Pre-flight: check that llama.cpp and models are set up ----
+$LlamaDir    = "tools\llamacpp"
+$ModelDir    = "tools\models"
+$TextModel   = Join-Path $ModelDir "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
+
+$hasBackend  = $false
+$backendList = @()
+if (Test-Path $LlamaDir) {
+    foreach ($b in @("cpu", "cuda", "vulkan")) {
+        $exe = Join-Path $LlamaDir "$b\llama-server.exe"
+        if (Test-Path $exe) {
+            $hasBackend = $true
+            $backendList += $b
+        }
+    }
+}
+
+$hasModel = Test-Path $TextModel
+
+if (-not $hasBackend -or -not $hasModel) {
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host "  [ERROR] LLM environment not ready!" -ForegroundColor Red
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host ""
+    if (-not $hasBackend) {
+        Write-Host "  Missing: llama-server binary (none found under $LlamaDir\)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [OK] Backends found: $($backendList -join ', ')" -ForegroundColor Green
+    }
+    if (-not $hasModel) {
+        Write-Host "  Missing: $TextModel" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [OK] Text model found" -ForegroundColor Green
+    }
+    Write-Host ""
+    Write-Host "  Please run first:" -ForegroundColor White
+    Write-Host "    .\scripts\setup_llama_cpp.bat" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Red
+    exit 1
+}
+
+if ($backendList.Count -gt 0) {
+    Write-Host "[PREFLIGHT] Backends: $($backendList -join ', ')  |  Model: $TextModel" -ForegroundColor DarkGray
+}
+
 # Always rebuild before running.
 Write-Host "[TIMING] $(Elapsed)s - Starting build..." -ForegroundColor DarkGray
 $BuildStart = Get-Date
@@ -32,7 +79,15 @@ $Exe = "target\release\disk_organizer.exe"
 $Snapshot = "scan.snapshot.json"
 
 if (-not (Test-Path $Snapshot)) {
-    Write-Host "[ERROR] No snapshot found. Run as Administrator first: .\scripts\test_llm_full.bat" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "[ERROR] No snapshot found: $Snapshot" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Two-step remedy:" -ForegroundColor White
+    Write-Host "    1. Run setup if you haven't yet:" -ForegroundColor White
+    Write-Host "       .\scripts\setup_llama_cpp.bat" -ForegroundColor Cyan
+    Write-Host "    2. Run full test as Administrator:" -ForegroundColor White
+    Write-Host "       .\scripts\test_llm_full.bat" -ForegroundColor Cyan
+    Write-Host ""
     exit 1
 }
 

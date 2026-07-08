@@ -10,6 +10,7 @@
 
 # Runtime logs and probe/analysis outputs
 /logs
+scripts/last_run_setup.log
 enrichment_probe_log.json
 analysis_result.json
 video_analysis_result.json
